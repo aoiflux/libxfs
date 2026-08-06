@@ -1,7 +1,6 @@
 package libxfs
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -10,57 +9,21 @@ import (
 
 const secondaryFeatureFlagFileType = 0x00000200
 
-// ListDirectoryEntries lists entries for a directory inode.
+// maxPathTraversalDepth bounds path resolution so that a crafted image cannot
+// drive unbounded traversal.
+const maxPathTraversalDepth = 1024
+
+// ListDirectoryEntries lists active entries for a directory inode.
 //
-// Currently this supports inline short-form directory data.
+// Short-form, block, leaf, node and btree directories are all supported:
+// entries always live in the directory's data-block region, which is walked
+// one directory block at a time.
 func (v *Volume) ListDirectoryEntries(inodeNumber uint64) ([]DirectoryEntry, error) {
-	inode, err := v.OpenInode(inodeNumber)
+	listing, err := v.scanDirectory(inodeNumber, DirectoryScanOptions{})
 	if err != nil {
 		return nil, err
 	}
-	if !inode.IsDirectory() {
-		return nil, wrapParseError(0, "directory_inode", ErrInvalidInode)
-	}
-
-	entries, err := parseShortFormDirectoryEntries(inode, v.ioh.formatVersion, v.ioh.secondaryFeatureFlags)
-	if err == nil {
-		return entries, nil
-	}
-	if !errors.Is(err, ErrUnsupportedDirFormat) {
-		return nil, err
-	}
-
-	if inode.Size > math.MaxInt {
-		return nil, wrapParseError(0, "inode_size", ErrInvalidInode)
-	}
-	data := make([]byte, int(inode.Size))
-	n, readErr := v.ReadInodeData(inodeNumber, data, 0)
-	if readErr != nil {
-		if readErr == io.EOF {
-			data = data[:n]
-		} else {
-			return nil, readErr
-		}
-	}
-	if n < len(data) {
-		data = data[:n]
-	}
-	if len(data) == 0 {
-		return nil, readErr
-	}
-	records, parseErr := parseBlockDirectoryRecords(data, v.ioh.formatVersion, v.ioh.secondaryFeatureFlags, false)
-	if parseErr != nil {
-		return nil, parseErr
-	}
-
-	out := make([]DirectoryEntry, 0, len(records))
-	for _, record := range records {
-		if record.IsDeleted {
-			continue
-		}
-		out = append(out, DirectoryEntry{Name: record.Name, InodeNumber: record.InodeNumber})
-	}
-	return out, nil
+	return listing.Entries, nil
 }
 
 // ListRootDirectoryEntries lists entries for the root directory inode.
@@ -89,6 +52,59 @@ func (v *Volume) OpenInodeByPath(path string) (*Inode, error) {
 	return v.OpenInode(inodeNumber)
 }
 
+// DirectoryParentInode returns the inode number a directory's ".." refers to.
+//
+// For short-form directories the parent is stored in the directory header; for
+// block-backed directories it is the ".." entry in the first data block. It is
+// the only in-inode link back up the tree, which makes it the starting point
+// for reconstructing the path of an orphaned directory.
+func (v *Volume) DirectoryParentInode(inodeNumber uint64) (uint64, error) {
+	inode, err := v.OpenInode(inodeNumber)
+	if err != nil {
+		return 0, err
+	}
+	if !inode.IsDirectory() {
+		return 0, wrapParseError(0, "directory_inode", ErrInvalidInode)
+	}
+
+	if inode.ForkType == ForkTypeInlineData {
+		header, err := parseShortFormDirectoryHeader(inode.InlineData)
+		if err != nil {
+			return 0, err
+		}
+		return header.parentInodeNumber, nil
+	}
+
+	block, err := v.readDirectoryBlock(inode, 0)
+	if err != nil {
+		return 0, err
+	}
+
+	records, _, err := parseDirectoryBlockRecords(block, directoryParseContext{
+		hasFileType:       directoryHasFileType(v.ioh.formatVersion, v.ioh.secondaryFeatureFlags),
+		includeDotEntries: true,
+	})
+	if err != nil {
+		return 0, err
+	}
+	for _, record := range records {
+		if record.Name == ".." {
+			return record.InodeNumber, nil
+		}
+	}
+	return 0, fmt.Errorf("%w: parent entry not found", ErrInodeNotFound)
+}
+
+// DirectoryParentInodeByPath resolves a directory path and returns its parent
+// inode number.
+func (v *Volume) DirectoryParentInodeByPath(path string) (uint64, error) {
+	inodeNumber, err := v.ResolveInodeByPath(path)
+	if err != nil {
+		return 0, err
+	}
+	return v.DirectoryParentInode(inodeNumber)
+}
+
 // ReadFileData reads all data bytes from a non-directory inode.
 func (v *Volume) ReadFileData(inodeNumber uint64) ([]byte, error) {
 	inode, err := v.OpenInode(inodeNumber)
@@ -98,8 +114,8 @@ func (v *Volume) ReadFileData(inodeNumber uint64) ([]byte, error) {
 	if inode.IsDirectory() {
 		return nil, wrapParseError(0, "inode_type", ErrInvalidInode)
 	}
-	if inode.Size > math.MaxInt {
-		return nil, wrapParseError(0, "inode_size", ErrInvalidInode)
+	if err := v.checkPlausibleSize(inode.Size); err != nil {
+		return nil, err
 	}
 
 	out := make([]byte, int(inode.Size))
@@ -122,10 +138,36 @@ func (v *Volume) ReadFileDataByPath(path string) ([]byte, error) {
 	return v.ReadFileData(inodeNumber)
 }
 
-// ResolveInodeByPath resolves an absolute path to an inode number.
+// checkPlausibleSize rejects sizes that exceed the capacity of the volume.
 //
-// Currently this depends on ListDirectoryEntries, so path traversal is limited
-// to inline short-form directories.
+// A recorded size is attacker controlled on a crafted image; allocating it
+// blindly is an out-of-memory vector. No object can be larger than the
+// filesystem that holds it.
+func (v *Volume) checkPlausibleSize(size uint64) error {
+	if size > math.MaxInt {
+		return wrapParseError(0, "inode_size", ErrInvalidInode)
+	}
+	capacity := v.volumeCapacityBytes()
+	if capacity != 0 && size > capacity {
+		return wrapParseError(int64(size), "inode_size", ErrInvalidInode)
+	}
+	return nil
+}
+
+// volumeCapacityBytes returns the addressable size of the volume, or zero when
+// the geometry is unknown. Nothing stored on the filesystem can be larger.
+func (v *Volume) volumeCapacityBytes() uint64 {
+	if v.sb == nil || v.sb.NumberOfBlocks == 0 || v.sb.BlockSize == 0 {
+		return 0
+	}
+	blockSize := uint64(v.sb.BlockSize)
+	if v.sb.NumberOfBlocks > math.MaxUint64/blockSize {
+		return 0
+	}
+	return v.sb.NumberOfBlocks * blockSize
+}
+
+// ResolveInodeByPath resolves an absolute path to an inode number.
 func (v *Volume) ResolveInodeByPath(path string) (uint64, error) {
 	if path == "" {
 		return 0, wrapParseError(0, "path", ErrInvalidPath)
@@ -142,7 +184,12 @@ func (v *Volume) ResolveInodeByPath(path string) (uint64, error) {
 	}
 
 	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) > maxPathTraversalDepth {
+		return 0, fmt.Errorf("%w: path exceeds maximum traversal depth", ErrInvalidPath)
+	}
+
 	current := v.sb.RootDirectoryInodeNumber
+	visited := map[uint64]struct{}{current: {}}
 
 	for _, part := range parts {
 		if part == "" || part == "." {
@@ -163,9 +210,64 @@ func (v *Volume) ResolveInodeByPath(path string) (uint64, error) {
 		if next == 0 {
 			return 0, fmt.Errorf("%w: %s", ErrInodeNotFound, part)
 		}
+		if _, loop := visited[next]; loop {
+			return 0, fmt.Errorf("%w: directory loop at %s", ErrInvalidPath, part)
+		}
+		visited[next] = struct{}{}
 		current = next
 	}
 	return current, nil
+}
+
+// shortFormDirectoryHeader is the fixed header of an inline directory.
+type shortFormDirectoryHeader struct {
+	numberOfEntries   int
+	parentInodeNumber uint64
+	inodeNumberSize   int
+	headerSize        int
+}
+
+// parseShortFormDirectoryHeader decodes the xfs_dir2_sf_hdr at the start of an
+// inline directory: count(1), i8count(1), parent(4 or 8).
+func parseShortFormDirectoryHeader(data []byte) (shortFormDirectoryHeader, error) {
+	header := shortFormDirectoryHeader{}
+	if len(data) < 6 {
+		return header, wrapParseError(0, "directory_header", ErrInvalidInode)
+	}
+
+	numberOf32BitEntries := int(data[0])
+	numberOf64BitEntries := int(data[1])
+	if numberOf32BitEntries != 0 && numberOf64BitEntries != 0 {
+		return header, wrapParseError(0, "directory_header", ErrInvalidInode)
+	}
+
+	header.inodeNumberSize = 4
+	header.numberOfEntries = numberOf32BitEntries
+	header.headerSize = 6
+	if numberOf64BitEntries != 0 {
+		header.inodeNumberSize = 8
+		header.numberOfEntries = numberOf64BitEntries
+		header.headerSize = 10
+	}
+	if header.headerSize > len(data) {
+		return header, wrapParseError(int64(header.headerSize), "directory_header", ErrInvalidInode)
+	}
+
+	if header.inodeNumberSize == 4 {
+		parent, ok := readUint32BE(data, 2)
+		if !ok {
+			return header, wrapParseError(2, "directory_parent_inode", ErrInvalidInode)
+		}
+		header.parentInodeNumber = uint64(parent)
+	} else {
+		parent, ok := readUint64BE(data, 2)
+		if !ok {
+			return header, wrapParseError(2, "directory_parent_inode", ErrInvalidInode)
+		}
+		header.parentInodeNumber = parent
+	}
+
+	return header, nil
 }
 
 func parseShortFormDirectoryEntries(inode *Inode, formatVersion uint8, secondaryFeatureFlags uint32) ([]DirectoryEntry, error) {
@@ -173,36 +275,20 @@ func parseShortFormDirectoryEntries(inode *Inode, formatVersion uint8, secondary
 		return nil, wrapParseError(0, "inode", ErrInvalidInode)
 	}
 	if inode.ForkType != ForkTypeInlineData {
-		return nil, fmt.Errorf("%w: only inline short-form directories are currently supported", ErrUnsupportedDirFormat)
+		return nil, fmt.Errorf("%w: directory is not in short-form inline format", ErrUnsupportedDirFormat)
 	}
 
 	data := inode.InlineData
-	if len(data) < 6 {
-		return nil, wrapParseError(0, "directory_header", ErrInvalidInode)
+	header, err := parseShortFormDirectoryHeader(data)
+	if err != nil {
+		return nil, err
 	}
 
-	numberOf32BitEntries := int(data[0])
-	numberOf64BitEntries := int(data[1])
-	if numberOf32BitEntries != 0 && numberOf64BitEntries != 0 {
-		return nil, wrapParseError(0, "directory_header", ErrInvalidInode)
-	}
+	hasFileType := directoryHasFileType(formatVersion, secondaryFeatureFlags)
+	entries := make([]DirectoryEntry, 0, header.numberOfEntries)
+	offset := header.headerSize
 
-	inodeNumberSize := 4
-	numberOfEntries := numberOf32BitEntries
-	offset := 6
-	if numberOf64BitEntries != 0 {
-		inodeNumberSize = 8
-		numberOfEntries = numberOf64BitEntries
-		offset = 10
-	}
-	if offset > len(data) {
-		return nil, wrapParseError(int64(offset), "directory_header", ErrInvalidInode)
-	}
-
-	hasFileType := formatVersion == 5 || (secondaryFeatureFlags&secondaryFeatureFlagFileType) != 0
-	entries := make([]DirectoryEntry, 0, numberOfEntries)
-
-	for i := 0; i < numberOfEntries; i++ {
+	for i := 0; i < header.numberOfEntries; i++ {
 		if offset+1 > len(data) {
 			return nil, wrapParseError(int64(offset), "directory_entry_header", ErrInvalidInode)
 		}
@@ -220,19 +306,21 @@ func parseShortFormDirectoryEntries(inode *Inode, formatVersion uint8, secondary
 		name := string(data[offset : offset+nameSize])
 		offset += nameSize
 
+		fileType := DirEntryFileTypeUnknown
 		if hasFileType {
 			if offset+1 > len(data) {
 				return nil, wrapParseError(int64(offset), "directory_entry_type", ErrInvalidInode)
 			}
+			fileType = data[offset]
 			offset++
 		}
 
-		if offset+inodeNumberSize > len(data) {
+		if offset+header.inodeNumberSize > len(data) {
 			return nil, wrapParseError(int64(offset), "directory_entry_inode", ErrInvalidInode)
 		}
 
 		inodeNumber := uint64(0)
-		if inodeNumberSize == 4 {
+		if header.inodeNumberSize == 4 {
 			value, ok := readUint32BE(data, offset)
 			if !ok {
 				return nil, wrapParseError(int64(offset), "directory_entry_inode", ErrInvalidInode)
@@ -245,9 +333,13 @@ func parseShortFormDirectoryEntries(inode *Inode, formatVersion uint8, secondary
 			}
 			inodeNumber = value
 		}
-		offset += inodeNumberSize
+		offset += header.inodeNumberSize
 
-		entries = append(entries, DirectoryEntry{Name: name, InodeNumber: inodeNumber})
+		entries = append(entries, DirectoryEntry{
+			Name:        name,
+			InodeNumber: inodeNumber,
+			FileType:    fileType,
+		})
 	}
 
 	return entries, nil

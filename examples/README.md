@@ -83,6 +83,19 @@ go run . ../../disk.img 128
 go run . ../../disk.img /carvey
 ```
 
+### 8. report - Structured Forensic Report
+
+Builds a combined report with volume metadata, per-inode details, and directory
+artifact records. The example prints a short human-readable summary to stderr
+and emits pretty JSON to stdout.
+
+```bash
+cd examples/report
+go run . ../../disk.img
+go run . ../../disk.img /carvey 500
+go run . ../../disk.img / 500 strict
+```
+
 ## Building Examples
 
 ```bash
@@ -105,6 +118,9 @@ cd ../fragmentation
 go build
 
 cd ../forensics
+go build
+
+cd ../report
 go build
 ```
 

@@ -77,7 +77,50 @@ type ExtendedAttribute struct {
 type DirectoryEntry struct {
 	Name        string
 	InodeNumber uint64
+	// FileType is the XFS directory entry file type (DirEntryFileType*).
+	// It is DirEntryFileTypeUnknown on filesystems without the ftype feature.
+	FileType uint8
 }
+
+// RecoveryConfidence labels how much trust a recovered directory record
+// deserves. It is a string alias so that existing comparisons against plain
+// string literals keep compiling.
+type RecoveryConfidence = string
+
+// Confidence levels applied to DirectoryRecord.Confidence.
+const (
+	ConfidenceLow    RecoveryConfidence = "low"
+	ConfidenceMedium RecoveryConfidence = "medium"
+	ConfidenceHigh   RecoveryConfidence = "high"
+)
+
+// DirectoryRecordKind distinguishes how a record was obtained. Confidence
+// alone is not a safe gate: an active entry and a carved candidate can both be
+// ConfidenceHigh. Switch on Kind, or use IsVerified/IsProbabilistic.
+type DirectoryRecordKind = string
+
+const (
+	// RecordKindActive is an entry parsed from intact directory framing.
+	RecordKindActive DirectoryRecordKind = "active"
+	// RecordKindFreeSlot is an unused-space run. It marks reclaimed space and
+	// carries no recovered name or inode number.
+	RecordKindFreeSlot DirectoryRecordKind = "free_slot"
+	// RecordKindCarved is a probabilistic candidate recovered from free space
+	// by pattern matching. It may be stale, partial, or entirely spurious.
+	RecordKindCarved DirectoryRecordKind = "carved"
+)
+
+// Evidence codes reported in DirectoryRecord.ConfidenceReasons.
+const (
+	ReasonIntactFraming    = "intact_framing"
+	ReasonTagMatchesOffset = "tag_matches_offset"
+	ReasonNamePrintable    = "name_printable"
+	ReasonAlignedOffset    = "aligned_offset"
+	ReasonFileTypeValid    = "ftype_valid"
+	ReasonInodeAllocated   = "inode_allocated"
+	ReasonInodeUnallocated = "inode_unallocated"
+	ReasonInFreeSlot       = "in_free_slot"
+)
 
 // DirectoryRecord represents an active or deleted slot recovered from
 // directory data structures.
@@ -88,7 +131,32 @@ type DirectoryRecord struct {
 	Offset       uint16
 	RecordLength uint16
 	IsCarved     bool
-	Confidence   string
+	Confidence   RecoveryConfidence
+
+	// Kind describes how this record was obtained. Prefer it over the
+	// IsDeleted/IsCarved pair when gating downstream decisions.
+	Kind DirectoryRecordKind
+	// FileType is the XFS directory entry file type (DirEntryFileType*).
+	FileType uint8
+	// BlockIndex is the directory-block index this record was found in.
+	BlockIndex uint64
+	// LogicalOffset is the absolute byte offset of the record within the
+	// directory data stream. Offset is only meaningful within its block.
+	LogicalOffset uint64
+	// ConfidenceReasons lists the evidence codes behind Confidence.
+	ConfidenceReasons []string
+}
+
+// IsVerified reports whether the record was parsed from intact directory
+// framing and can be treated as fact.
+func (r DirectoryRecord) IsVerified() bool {
+	return r.Kind == RecordKindActive || (r.Kind == "" && !r.IsCarved && !r.IsDeleted)
+}
+
+// IsProbabilistic reports whether the record was carved heuristically and must
+// be presented as a candidate rather than as fact.
+func (r DirectoryRecord) IsProbabilistic() bool {
+	return r.IsCarved
 }
 
 // FragmentationReport summarizes how a file's data is laid out across extents.

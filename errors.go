@@ -17,6 +17,7 @@ var (
 	ErrUnsupportedFeatureFlag = errors.New("unsupported XFS feature flag")
 	ErrUnsupportedXattrFormat = errors.New("unsupported extended attribute format")
 	ErrVolumeClosed           = errors.New("volume is closed")
+	ErrVerificationFailed     = errors.New("forensic verification failed")
 )
 
 type ParseError struct {
