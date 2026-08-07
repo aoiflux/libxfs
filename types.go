@@ -18,6 +18,37 @@ type Superblock struct {
 	SecondaryFeatureFlags    uint32
 	RelativeBlockNumberBits  uint8
 	RelativeInodeNumberBits  uint8
+
+	// v5-only feature words. These are zero on v4 filesystems, which do not
+	// have the fields at all.
+	FeaturesCompat         uint32
+	FeaturesReadOnlyCompat uint32
+	FeaturesIncompat       uint32
+	FeaturesLogIncompat    uint32
+}
+
+// HasFeatureIncompat reports whether an incompatible feature bit is set.
+func (s Superblock) HasFeatureIncompat(feature uint32) bool {
+	return s.FeaturesIncompat&feature != 0
+}
+
+// HasBigTimestamps reports whether inode timestamps use the 64-bit "bigtime"
+// encoding rather than the legacy 32-bit seconds/nanoseconds pair.
+func (s Superblock) HasBigTimestamps() bool {
+	return s.HasFeatureIncompat(FeatureIncompatBigTime)
+}
+
+// HasLargeExtentCounts reports whether inodes use the 64-bit extent counters
+// introduced by the nrext64 feature.
+func (s Superblock) HasLargeExtentCounts() bool {
+	return s.HasFeatureIncompat(FeatureIncompatLargeExtentCounts)
+}
+
+// NeedsRepair reports whether the filesystem was marked as requiring repair.
+// Such an image was left in an inconsistent state and its metadata should be
+// treated with suspicion.
+func (s Superblock) NeedsRepair() bool {
+	return s.HasFeatureIncompat(FeatureIncompatNeedsRepair)
 }
 
 type InodeInformation struct {
@@ -41,11 +72,23 @@ type Inode struct {
 	InodeChangeTimeNS  int64
 	CreationTimeNS     int64
 
-	Size                     uint64
-	NumberOfDataExtents      uint32
+	Size uint64
+	// NumberOfDataExtents is the data fork extent count, saturated to 32 bits.
+	// On filesystems with the nrext64 feature the on-disk counter is 64 bits
+	// wide; prefer DataExtentCount, which cannot overflow.
+	NumberOfDataExtents uint32
+	// NumberOfAttributesExtent is the attribute fork extent count, saturated
+	// to 16 bits. Prefer AttributeExtentCount.
 	NumberOfAttributesExtent uint16
-	AttributesForkType       uint8
-	DeviceIdentifier         uint32
+	// DataExtentCount is the full-width data fork extent count.
+	DataExtentCount uint64
+	// AttributeExtentCount is the full-width attribute fork extent count.
+	AttributeExtentCount uint32
+	// HasBigTimestamps records whether this inode's timestamps were decoded
+	// using the 64-bit bigtime encoding.
+	HasBigTimestamps   bool
+	AttributesForkType uint8
+	DeviceIdentifier   uint32
 
 	DataForkOffset       uint16
 	DataForkSize         uint16

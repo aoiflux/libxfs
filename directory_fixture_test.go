@@ -61,7 +61,8 @@ type fixtureImage struct {
 	dirBlockSize  uint32
 	// nextBlock is the next free filesystem block for payload allocation.
 	// Blocks 0..7 are reserved for the superblock, AGI and inode area.
-	nextBlock uint64
+	nextBlock        uint64
+	featuresIncompat uint32
 }
 
 // newFixtureImage builds an empty image. dirBlockLog is log2 of the number of
@@ -121,6 +122,43 @@ func newFixtureImage(formatVersion uint8, dirBlockLog uint8) *fixtureImage {
 	return image
 }
 
+// setFeaturesIncompat sets the v5 sb_features_incompat word.
+func (f *fixtureImage) setFeaturesIncompat(features uint32) {
+	f.featuresIncompat = features
+	binary.BigEndian.PutUint32(f.data[216:220], features)
+}
+
+func (f *fixtureImage) hasBigTime() bool {
+	return f.featuresIncompat&FeatureIncompatBigTime != 0
+}
+
+func (f *fixtureImage) hasLargeExtentCounts() bool {
+	return f.featuresIncompat&FeatureIncompatLargeExtentCounts != 0
+}
+
+// writeInodeTimestamps stamps all four inode timestamps, encoding them the way
+// the image's feature flags say they should be stored.
+func (f *fixtureImage) writeInodeTimestamps(inodeNumber uint64, unixNanos int64) {
+	base := inodeNumber * fixtureInodeSize
+	for _, offset := range []uint64{32, 40, 48, 144} {
+		at := base + offset
+		if f.hasBigTime() {
+			// bigtime counts nanoseconds from 1901-12-13 20:45:52 UTC.
+			raw := uint64(unixNanos/1_000_000_000+fixtureBigTimeEpochOffset)*1_000_000_000 +
+				uint64(unixNanos%1_000_000_000)
+			binary.BigEndian.PutUint64(f.data[at:at+8], raw)
+			continue
+		}
+		binary.BigEndian.PutUint32(f.data[at:at+4], uint32(unixNanos/1_000_000_000))
+		binary.BigEndian.PutUint32(f.data[at+4:at+8], uint32(unixNanos%1_000_000_000))
+	}
+}
+
+// fixtureBigTimeEpochOffset is derived from the format definition rather than
+// reused from the parser, so a regression in the parser cannot be mirrored by
+// the fixture. It is -(int64)S32_MIN.
+const fixtureBigTimeEpochOffset = int64(1) << 31
+
 // hasFileType reports whether entries in this image carry an ftype byte.
 func (f *fixtureImage) hasFileType() bool {
 	return f.formatVersion == 5
@@ -160,8 +198,15 @@ func (f *fixtureImage) writeInode(inodeNumber uint64, mode uint16, forkType uint
 	binary.BigEndian.PutUint32(buf[offset+12:offset+16], 1000)
 	binary.BigEndian.PutUint32(buf[offset+16:offset+20], 2)
 	binary.BigEndian.PutUint64(buf[offset+56:offset+64], size)
-	binary.BigEndian.PutUint32(buf[offset+76:offset+80], extentCount)
-	binary.BigEndian.PutUint16(buf[offset+80:offset+82], 0)
+	if f.hasLargeExtentCounts() {
+		// nrext64 moves the data fork count to a 64-bit field at offset 24 and
+		// widens the attribute fork count to 32 bits at offset 76.
+		binary.BigEndian.PutUint64(buf[offset+24:offset+32], uint64(extentCount))
+		binary.BigEndian.PutUint32(buf[offset+76:offset+80], 0)
+	} else {
+		binary.BigEndian.PutUint32(buf[offset+76:offset+80], extentCount)
+		binary.BigEndian.PutUint16(buf[offset+80:offset+82], 0)
+	}
 	buf[offset+82] = 0
 	buf[offset+83] = 0
 
@@ -250,6 +295,17 @@ func (f *fixtureImage) addBtreeDirectory(inodeNumber uint64, blocks [][]byte) {
 	binary.BigEndian.PutUint16(f.data[forkOffset+2:forkOffset+4], 1)
 	pointerOffset := forkOffset + 4 + (forkSize-4)/16*8
 	binary.BigEndian.PutUint64(f.data[pointerOffset:pointerOffset+8], nodeBlock)
+}
+
+// setAttributeExtentCount writes the attribute fork extent count at whichever
+// offset the image's feature flags dictate.
+func (f *fixtureImage) setAttributeExtentCount(inodeNumber uint64, count uint32) {
+	offset := inodeNumber * fixtureInodeSize
+	if f.hasLargeExtentCounts() {
+		binary.BigEndian.PutUint32(f.data[offset+76:offset+80], count)
+		return
+	}
+	binary.BigEndian.PutUint16(f.data[offset+80:offset+82], uint16(count))
 }
 
 // setInodeSize overrides a directory inode's recorded size, for testing how

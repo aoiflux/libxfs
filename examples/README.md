@@ -122,7 +122,25 @@ go build
 
 cd ../report
 go build
+
+cd ../dirscan
+go build
 ```
+
+## dirscan
+
+Scans one directory with best-effort recovery enabled, which keeps whatever
+parsed when a block is damaged instead of failing the whole scan.
+
+```bash
+cd dirscan
+go run . disk.img /var/log
+go run . disk.img 128 5000
+```
+
+Output separates verified active entries from carved deleted candidates, and
+prints the evidence behind each candidate's confidence. Carved records are
+probabilistic and must never be presented as fact.
 
 ## Important: Windows Raw Drive Access
 

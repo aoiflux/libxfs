@@ -79,9 +79,6 @@ func TestReportBuildsRootEntryAndSummary(t *testing.T) {
 	if report.Summary() == "" {
 		t.Fatalf("expected non-empty human summary")
 	}
-	if report.Provenance.ParserVersion != Version {
-		t.Fatalf("expected parser version %q, got %q", Version, report.Provenance.ParserVersion)
-	}
 	if report.Provenance.VerificationMode != VerificationModeBestEffort {
 		t.Fatalf("expected best-effort mode, got %q", report.Provenance.VerificationMode)
 	}

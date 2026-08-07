@@ -55,8 +55,10 @@ type DirectoryListing struct {
 	InodeNumber uint64 `json:"inode_number"`
 	// Entries holds active entries only, in on-disk order.
 	Entries []DirectoryEntry `json:"entries,omitempty"`
-	// Records holds every record produced by the scan, including free slots
-	// and carved candidates when IncludeDeleted is set.
+	// Records holds every record produced by a forensic scan: active entries,
+	// free slots and carved candidates. It is populated by the
+	// ScanDirectoryRecords* APIs. A plain listing leaves it empty, since
+	// building it would double the cost of the common path; use Entries there.
 	Records []DirectoryRecord `json:"records,omitempty"`
 	// Anomalies records structural problems encountered in best-effort mode.
 	Anomalies []ReportAnomaly `json:"anomalies,omitempty"`
@@ -268,6 +270,7 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 		listing.Truncated = true
 	}
 	maxEntries := options.maxEntries()
+	collected := 0
 
 	buffer := make([]byte, directoryBlockSize)
 
@@ -321,11 +324,12 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 		}
 
 		records, anomalies, err := parseDirectoryBlockRecords(block, directoryParseContext{
-			hasFileType:    directoryHasFileType(v.ioh.formatVersion, v.ioh.secondaryFeatureFlags),
-			includeDeleted: options.IncludeDeleted,
-			bestEffort:     options.BestEffort,
-			blockIndex:     blockIndex,
-			blockOffset:    blockOffset,
+			hasFileType:          directoryHasFileType(v.ioh.formatVersion, v.ioh.secondaryFeatureFlags),
+			includeDeleted:       options.IncludeDeleted,
+			bestEffort:           options.BestEffort,
+			explainActiveRecords: options.IncludeDeleted,
+			blockIndex:           blockIndex,
+			blockOffset:          blockOffset,
 		})
 		for i := range anomalies {
 			anomalies[i].Inode = listing.InodeNumber
@@ -345,11 +349,17 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 		}
 
 		for _, record := range records {
-			if len(listing.Records) >= maxEntries {
+			if collected >= maxEntries {
 				listing.Truncated = true
 				return listing, nil
 			}
-			listing.Records = append(listing.Records, record)
+			collected++
+
+			// A plain listing never surfaces Records, so building them would
+			// double the allocation for the hottest path in the library.
+			if options.IncludeDeleted {
+				listing.Records = append(listing.Records, record)
+			}
 			if record.Kind == RecordKindActive {
 				listing.Entries = append(listing.Entries, DirectoryEntry{
 					Name:        record.Name,

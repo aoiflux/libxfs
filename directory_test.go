@@ -482,11 +482,26 @@ func TestDirectoryEntryCapTruncates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("capped listing failed: %v", err)
 	}
-	if len(listing.Records) != 10 {
-		t.Fatalf("expected the cap to apply, got %d records", len(listing.Records))
+	if len(listing.Entries) != 10 {
+		t.Fatalf("expected the cap to apply, got %d entries", len(listing.Entries))
 	}
 	if !listing.Truncated {
 		t.Fatal("a capped listing must report truncation rather than look complete")
+	}
+	// A listing does not surface Records; only a forensic scan does.
+	if len(listing.Records) != 0 {
+		t.Fatalf("a listing should not build records, got %d", len(listing.Records))
+	}
+
+	scan, err := volume.ScanDirectoryRecordsWithOptions(fixtureFirstInode, DirectoryScanOptions{MaxEntries: 10})
+	if err != nil {
+		t.Fatalf("capped scan failed: %v", err)
+	}
+	if len(scan.Records) != 10 {
+		t.Fatalf("expected the cap to apply to records, got %d", len(scan.Records))
+	}
+	if !scan.Truncated {
+		t.Fatal("a capped scan must report truncation")
 	}
 }
 

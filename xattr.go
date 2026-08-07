@@ -64,7 +64,10 @@ func xattrNamespaceFromFlags(flags uint8) (prefix string, namespace string, err 
 	case 2:
 		return "trusted.", "trusted", nil
 	case 4:
-		return "secure.", "secure", nil
+		// XFS_ATTR_SECURE maps to the Linux "security" namespace, which is
+		// how these attributes appear to getfattr and to every tool that
+		// matches on names such as "security.selinux".
+		return "security.", "security", nil
 	default:
 		return "", "", wrapParseError(0, "xattr_flags", ErrUnsupportedXattrFormat)
 	}

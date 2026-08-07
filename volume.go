@@ -17,6 +17,8 @@ type ioHandle struct {
 	directoryBlockSize      uint32
 	relativeBlockNumberBits uint8
 	relativeInodeNumberBits uint8
+	bigTime                 bool
+	largeExtentCounts       bool
 }
 
 // Volume is an XFS volume parser with concurrency-safe read APIs.
@@ -35,21 +37,12 @@ type Volume struct {
 	closeMu sync.RWMutex
 }
 
-// Open parses an XFS volume from a random-access reader.
-func Open(reader io.ReaderAt) (*Volume, error) {
-	if reader == nil {
-		return nil, wrapVolumeError("open", fmt.Errorf("reader is nil"))
+// inodeFeatures returns the superblock feature bits that change inode layout.
+func (v *Volume) inodeFeatures() inodeFeatures {
+	return inodeFeatures{
+		bigTime:           v.ioh.bigTime,
+		largeExtentCounts: v.ioh.largeExtentCounts,
 	}
-
-	v := &Volume{
-		reader:     reader,
-		inodeCache: make(map[uint64]*Inode),
-	}
-
-	if err := v.parseAllocationGroups(); err != nil {
-		return nil, wrapVolumeError("open", err)
-	}
-	return v, nil
 }
 
 func (v *Volume) Close() error {
@@ -138,7 +131,7 @@ func (v *Volume) OpenInode(inodeNumber uint64) (*Inode, error) {
 		return nil, wrapIOError("read", offset, len(buf), err)
 	}
 
-	inode, err := parseInode(buf, v.ioh.blockSize)
+	inode, err := parseInode(buf, v.ioh.blockSize, v.inodeFeatures())
 	if err != nil {
 		return nil, err
 	}
@@ -409,10 +402,10 @@ func (v *Volume) populateAttributesFork(inode *Inode) error {
 	case ForkTypeInlineData:
 		inode.InlineAttributesData = append([]byte(nil), data...)
 	case ForkTypeExtents:
-		if inode.NumberOfAttributesExtent == 0 {
+		if inode.AttributeExtentCount == 0 {
 			return nil
 		}
-		extents, err := parseExtentList(numberOfBlocks, uint32(inode.NumberOfAttributesExtent), data, false)
+		extents, err := parseExtentList(numberOfBlocks, inode.AttributeExtentCount, data, false)
 		if err != nil {
 			return err
 		}
@@ -762,6 +755,8 @@ func (v *Volume) parseAllocationGroups() error {
 		directoryBlockSize:      sb.DirectoryBlockSize,
 		relativeBlockNumberBits: sb.RelativeBlockNumberBits,
 		relativeInodeNumberBits: sb.RelativeInodeNumberBits,
+		bigTime:                 sb.HasBigTimestamps(),
+		largeExtentCounts:       sb.HasLargeExtentCounts(),
 	}
 
 	v.agInode = make([]InodeInformation, 0, sb.NumberOfAllocationGroups)
@@ -873,6 +868,24 @@ func parseSuperblock(data []byte) (*Superblock, error) {
 		return nil, wrapParseError(106, "number_of_inodes_per_block", ErrInvalidSuperblock)
 	}
 
+	// The feature words only exist on v5 superblocks; on v4 the space holds
+	// unrelated data and must not be interpreted.
+	var featuresCompat, featuresReadOnly, featuresIncompat, featuresLogIncompat uint32
+	if formatVersion == 5 {
+		featuresCompat, _ = readUint32BE(data, superblockFeaturesCompatOffset)
+		featuresReadOnly, _ = readUint32BE(data, superblockFeaturesReadOnlyOffset)
+		featuresIncompat, _ = readUint32BE(data, superblockFeaturesIncompatOffset)
+		featuresLogIncompat, _ = readUint32BE(data, superblockFeaturesLogIncompatOffset)
+
+		// An unrecognised incompatible feature changes the on-disk layout in
+		// a way this parser cannot account for. Reading on would silently
+		// produce wrong metadata, which is worse than refusing.
+		if unknown := featuresIncompat &^ knownFeaturesIncompat; unknown != 0 {
+			return nil, fmt.Errorf("%w: unknown incompatible feature bits 0x%08x",
+				ErrUnsupportedFeatureFlag, unknown)
+		}
+	}
+
 	return &Superblock{
 		BlockSize:                blockSize,
 		NumberOfBlocks:           numberOfBlocks,
@@ -889,6 +902,10 @@ func parseSuperblock(data []byte) (*Superblock, error) {
 		SecondaryFeatureFlags:    secondaryFeatureFlags,
 		RelativeBlockNumberBits:  relativeBlockBits,
 		RelativeInodeNumberBits:  relativeInodeBits,
+		FeaturesCompat:           featuresCompat,
+		FeaturesReadOnlyCompat:   featuresReadOnly,
+		FeaturesIncompat:         featuresIncompat,
+		FeaturesLogIncompat:      featuresLogIncompat,
 	}, nil
 }
 
@@ -919,7 +936,14 @@ func parseInodeInformation(data []byte, formatVersion uint8) (*InodeInformation,
 	}, nil
 }
 
-func parseInode(data []byte, blockSize uint32) (*Inode, error) {
+// inodeFeatures carries the superblock feature bits that change how an inode
+// is laid out on disk.
+type inodeFeatures struct {
+	bigTime           bool
+	largeExtentCounts bool
+}
+
+func parseInode(data []byte, blockSize uint32, features inodeFeatures) (*Inode, error) {
 	if len(data) < minInodeSize {
 		return nil, wrapParseError(0, "inode", ErrInvalidInode)
 	}
@@ -952,17 +976,28 @@ func parseInode(data []byte, blockSize uint32) (*Inode, error) {
 		numberOfLinks, _ = readUint32BE(data, 16)
 	}
 
-	atSec, _ := readUint32BE(data, 32)
-	atNs, _ := readUint32BE(data, 36)
-	mtSec, _ := readUint32BE(data, 40)
-	mtNs, _ := readUint32BE(data, 44)
-	ctSec, _ := readUint32BE(data, 48)
-	ctNs, _ := readUint32BE(data, 52)
+	// Bigtime only applies to v3 inodes; v1/v2 inodes always use the legacy
+	// encoding regardless of what the superblock advertises.
+	bigTime := features.bigTime && formatVersion == 3
+
 	size, _ := readUint64BE(data, 56)
-	nDataExtents, _ := readUint32BE(data, 76)
-	nAttrExtents, _ := readUint16BE(data, 80)
 	attrForkOffset := uint16(data[82]) * 8
 	attrForkType := data[83]
+
+	// With the nrext64 feature the extent counters move and widen: the data
+	// fork count becomes a 64-bit value in the padding at offset 24, and the
+	// attribute fork count becomes a 32-bit value at offset 76.
+	var dataExtentCount uint64
+	var attrExtentCount uint32
+	if features.largeExtentCounts {
+		dataExtentCount, _ = readUint64BE(data, 24)
+		attrExtentCount, _ = readUint32BE(data, 76)
+	} else {
+		narrowData, _ := readUint32BE(data, 76)
+		narrowAttr, _ := readUint16BE(data, 80)
+		dataExtentCount = uint64(narrowData)
+		attrExtentCount = uint32(narrowAttr)
+	}
 
 	inode := &Inode{
 		FormatVersion:            formatVersion,
@@ -971,20 +1006,21 @@ func parseInode(data []byte, blockSize uint32) (*Inode, error) {
 		OwnerID:                  ownerID,
 		GroupID:                  groupID,
 		NumberOfLinks:            numberOfLinks,
-		AccessTimeNS:             signedSecondsWithNanos(atSec, atNs),
-		ModificationTimeNS:       signedSecondsWithNanos(mtSec, mtNs),
-		InodeChangeTimeNS:        signedSecondsWithNanos(ctSec, ctNs),
+		AccessTimeNS:             readInodeTimestamp(data, 32, bigTime),
+		ModificationTimeNS:       readInodeTimestamp(data, 40, bigTime),
+		InodeChangeTimeNS:        readInodeTimestamp(data, 48, bigTime),
 		Size:                     size,
-		NumberOfDataExtents:      nDataExtents,
-		NumberOfAttributesExtent: nAttrExtents,
+		NumberOfDataExtents:      saturateUint32(dataExtentCount),
+		NumberOfAttributesExtent: saturateUint16(attrExtentCount),
+		DataExtentCount:          dataExtentCount,
+		AttributeExtentCount:     attrExtentCount,
+		HasBigTimestamps:         bigTime,
 		AttributesForkType:       attrForkType,
 		Raw:                      append([]byte(nil), data...),
 	}
 
 	if formatVersion == 3 {
-		createSec, _ := readUint32BE(data, 144)
-		createNs, _ := readUint32BE(data, 148)
-		inode.CreationTimeNS = signedSecondsWithNanos(createSec, createNs)
+		inode.CreationTimeNS = readInodeTimestamp(data, 144, bigTime)
 	}
 
 	dataForkSize := len(data) - inodeHeaderSize
@@ -1031,7 +1067,7 @@ func parseInode(data []byte, blockSize uint32) (*Inode, error) {
 			numberOfBlocks++
 		}
 		addSparseExtents := !inode.IsDirectory()
-		numberOfExtents := inode.NumberOfDataExtents
+		numberOfExtents := saturateUint32(inode.DataExtentCount)
 		if numberOfExtents == 0 {
 			numberOfExtents = inferExtentCount(data[start:end])
 		}

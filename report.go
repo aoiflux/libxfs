@@ -21,7 +21,6 @@ const (
 
 // ReportProvenance captures parser and verification context for reproducibility.
 type ReportProvenance struct {
-	ParserVersion        string           `json:"parser_version"`
 	VerificationMode     VerificationMode `json:"verification_mode"`
 	Coverage             []string         `json:"coverage"`
 	SuperblockCRCChecked bool             `json:"superblock_crc_checked"`
@@ -155,7 +154,7 @@ func (r *XFSReport) Summary() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "=== XFS Forensic Report Summary ===\n")
 	fmt.Fprintf(&b, "Generated: %s\n", r.GeneratedAt.Format(time.RFC3339))
-	fmt.Fprintf(&b, "Parser: %s mode=%s\n", r.Provenance.ParserVersion, r.Provenance.VerificationMode)
+	fmt.Fprintf(&b, "Verification mode: %s\n", r.Provenance.VerificationMode)
 	fmt.Fprintf(&b, "Root path: %s\n", r.RootPath)
 	fmt.Fprintf(&b, "Filesystem: %s v%d block=%d inode=%d dir_block=%d\n",
 		r.Volume.Type,
@@ -433,7 +432,6 @@ func (v *Volume) ReportWithOptions(options ReportOptions) (*XFSReport, error) {
 		GeneratedAt: time.Now().UTC(),
 		RootPath:    rootPath,
 		Provenance: ReportProvenance{
-			ParserVersion:    Version,
 			VerificationMode: mode,
 			Coverage: []string{
 				"geometry_sanity",

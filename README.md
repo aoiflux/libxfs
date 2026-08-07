@@ -67,7 +67,8 @@ func main() {
 
 Implemented:
 
-- Superblock parsing and validation
+- Superblock parsing and validation, including the v5 feature words
+- 64-bit "bigtime" inode timestamps and 64-bit (`nrext64`) extent counters
 - AGI and inode-btree driven inode lookup
 - Inode parsing (v1/v2/v3 layouts)
 - Data reads from inline, extent-list, and extent-btree-backed forks
@@ -185,6 +186,23 @@ damage, and collect `ReportAnomaly` entries describing what went wrong.
 `MaxBlocks` and `MaxEntries` bound the work; when a cap is reached the listing
 reports `Truncated` rather than silently looking complete.
 
+## Filesystem Features
+
+v5 filesystems record feature flags that change the on-disk layout. libxfs reads
+them and adapts; an image carrying an incompatible feature it does not understand
+is refused rather than silently misparsed.
+
+```go
+sb := vol.Superblock()
+sb.HasBigTimestamps()     // 64-bit nanosecond timestamps (mkfs default since 2021)
+sb.HasLargeExtentCounts() // nrext64: 64-bit extent counters
+sb.NeedsRepair()          // filesystem was left needing repair; treat metadata with suspicion
+```
+
+Timestamps matter most here. A bigtime timestamp decoded as the legacy format
+yields a date roughly 27 years early, which is plausible enough to pass
+unnoticed, so `Inode.HasBigTimestamps` records which encoding was used.
+
 ## Error Handling
 
 libxfs uses wrapped typed errors so callers can reliably inspect failures.
@@ -217,6 +235,8 @@ Available examples:
 - `examples/forensics`: inspect active/deleted directory records and carved
   candidates
 - `examples/report`: build structured forensic report output (JSON + summary)
+- `examples/dirscan`: scan a large or damaged directory with best-effort
+  recovery, separating verified entries from carved candidates
 
 Run one example:
 
@@ -250,9 +270,19 @@ go test ./...
 go vet ./...
 ```
 
+Conformance tests can be run against a real XFS image. They are skipped unless
+an image is supplied:
+
+```bash
+LIBXFS_TEST_IMAGE=/path/to/xfs.dd go test ./...
+```
+
+Synthetic fixtures only prove the parser agrees with its author's reading of the
+format. Testing against an image from `mkfs.xfs` is what catches a
+misunderstanding shared by both the parser and its fixtures.
+
 ## Project Status
 
-Beta.
-
-Core parsing features and forensic helper APIs are implemented and tested, with
-ongoing hardening around malformed metadata and edge-case directory layouts.
+Core parsing features and forensic helper APIs are implemented and tested,
+including validation against real `mkfs.xfs` images, with ongoing hardening
+around malformed metadata and edge-case directory layouts.

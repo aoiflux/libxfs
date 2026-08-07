@@ -19,8 +19,12 @@ type directoryParseContext struct {
 	// includeDotEntries keeps the "." and ".." entries, which are otherwise
 	// filtered out of listings. Used to recover a directory's parent link.
 	includeDotEntries bool
-	blockIndex        uint64
-	blockOffset       uint64
+	// explainActiveRecords populates ConfidenceReasons for active entries.
+	// Only forensic scans need it; a plain listing does not, and the
+	// per-entry allocation is measurable on a large directory.
+	explainActiveRecords bool
+	blockIndex           uint64
+	blockOffset          uint64
 }
 
 // directoryHasFileType reports whether directory entries carry an ftype byte.
@@ -234,9 +238,15 @@ func parseDirectoryBlockRecords(block []byte, ctx directoryParseContext) ([]Dire
 		}
 
 		if ctx.includeDotEntries || (name != "." && name != "..") {
-			reasons := []string{ReasonIntactFraming}
-			if ctx.hasFileType && fileType < dirEntryFileTypeMax {
-				reasons = append(reasons, ReasonFileTypeValid)
+			// Active records carry no evidence list: intact framing is implied
+			// by RecordKindActive. Allocating a slice per entry to say so cost
+			// more than the parse itself on a large directory.
+			var reasons []string
+			if ctx.explainActiveRecords {
+				reasons = []string{ReasonIntactFraming}
+				if ctx.hasFileType && fileType < dirEntryFileTypeMax {
+					reasons = append(reasons, ReasonFileTypeValid)
+				}
 			}
 			records = append(records, DirectoryRecord{
 				Name:              name,

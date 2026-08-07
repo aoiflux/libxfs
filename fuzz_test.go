@@ -152,7 +152,7 @@ func FuzzParseInode(f *testing.F) {
 		if blockSize == 0 {
 			blockSize = fixtureBlockSize
 		}
-		inode, err := parseInode(data, blockSize)
+		inode, err := parseInode(data, blockSize, inodeFeatures{})
 		if err != nil {
 			return
 		}
