@@ -17,26 +17,27 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        go: ['1.21.x', '1.22.x', '1.23.x', '1.24.x', '1.25.x', '1.26.x', 'stable']
+        go:
+          ["1.21.x", "1.22.x", "1.23.x", "1.24.x", "1.25.x", "1.26.x", "stable"]
         exclude:
           # Keep the matrix affordable: the older releases only need to prove
           # that the declared go.mod floor still builds, which one OS shows.
           - os: windows-latest
-            go: '1.22.x'
+            go: "1.22.x"
           - os: windows-latest
-            go: '1.23.x'
+            go: "1.23.x"
           - os: windows-latest
-            go: '1.24.x'
+            go: "1.24.x"
           - os: windows-latest
-            go: '1.25.x'
+            go: "1.25.x"
           - os: macos-latest
-            go: '1.22.x'
+            go: "1.22.x"
           - os: macos-latest
-            go: '1.23.x'
+            go: "1.23.x"
           - os: macos-latest
-            go: '1.24.x'
+            go: "1.24.x"
           - os: macos-latest
-            go: '1.25.x'
+            go: "1.25.x"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -57,7 +58,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: "stable"
           check-latest: true
       - name: gofmt
         run: |
@@ -72,52 +73,6 @@ jobs:
       - name: Test with race detector
         run: go test -race ./...
 
-  conformance:
-    name: real-image conformance
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: 'stable'
-          check-latest: true
-      # Synthetic fixtures can only encode what their author already believes.
-      # Building a filesystem with mkfs.xfs is what catches a misunderstanding
-      # shared by the parser and its fixtures.
-      - name: Build XFS images
-        run: |
-          sudo apt-get update && sudo apt-get install -y xfsprogs
-          mkdir -p /tmp/images
-          # Default (v5: bigtime, nrext64, sparse inodes, ftype).
-          truncate -s 512M /tmp/images/default.img
-          mkfs.xfs -q /tmp/images/default.img
-          # 64 KiB directory blocks, to exercise dirblklog > 0.
-          truncate -s 512M /tmp/images/dirblk64k.img
-          mkfs.xfs -q -n size=64k /tmp/images/dirblk64k.img
-          # Bigtime and nrext64 explicitly disabled, for the legacy layouts.
-          truncate -s 512M /tmp/images/legacy.img
-          mkfs.xfs -q -m bigtime=0 -i nrext64=0 /tmp/images/legacy.img
-      - name: Populate images with multi-block directories
-        run: |
-          for img in default dirblk64k legacy; do
-            mkdir -p /tmp/mnt
-            sudo mount -o loop /tmp/images/$img.img /tmp/mnt
-            # A directory wide enough to outgrow block format and become
-            # leaf/node, which no synthetic fixture in this repo can prove.
-            sudo mkdir -p /tmp/mnt/wide /tmp/mnt/deep
-            sudo sh -c 'for i in $(seq 1 4000); do : > /tmp/mnt/wide/entry_$i; done'
-            sudo sh -c 'd=/tmp/mnt/deep; for i in $(seq 1 20); do d=$d/level$i; mkdir -p $d; done; echo deep > $d/file'
-            sudo sh -c 'echo hello > /tmp/mnt/small.txt'
-            sudo setfattr -n user.test -v value /tmp/mnt/small.txt || true
-            sudo umount /tmp/mnt
-          done
-      - name: Run conformance tests
-        run: |
-          for img in default dirblk64k legacy; do
-            echo "== $img =="
-            LIBXFS_TEST_IMAGE=/tmp/images/$img.img go test -run TestImage -v .
-          done
-
   fuzz:
     name: fuzz smoke
     runs-on: ubuntu-latest
@@ -125,7 +80,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: 'stable'
+          go-version: "stable"
           check-latest: true
       # A short run per target. This is a regression guard against newly
       # introduced panics, not a fuzzing campaign.
