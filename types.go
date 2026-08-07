@@ -162,7 +162,10 @@ const (
 	ReasonFileTypeValid    = "ftype_valid"
 	ReasonInodeAllocated   = "inode_allocated"
 	ReasonInodeUnallocated = "inode_unallocated"
-	ReasonInFreeSlot       = "in_free_slot"
+	// ReasonInodeUnaddressable marks a recovered inode number that cannot
+	// address anything on this volume — strong evidence of a false match.
+	ReasonInodeUnaddressable = "inode_unaddressable"
+	ReasonInFreeSlot         = "in_free_slot"
 )
 
 // DirectoryRecord represents an active or deleted slot recovered from

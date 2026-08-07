@@ -58,16 +58,16 @@ func parseShortFormAttributes(data []byte) ([]ExtendedAttribute, error) {
 }
 
 func xattrNamespaceFromFlags(flags uint8) (prefix string, namespace string, err error) {
-	switch flags & 0x7e {
+	switch flags & xattrNamespaceMask {
 	case 0:
-		return "user.", "user", nil
-	case 2:
-		return "trusted.", "trusted", nil
-	case 4:
+		return XattrNamespaceUser + namespaceSeparator, XattrNamespaceUser, nil
+	case xattrFlagRoot:
+		return XattrNamespaceTrusted + namespaceSeparator, XattrNamespaceTrusted, nil
+	case xattrFlagSecure:
 		// XFS_ATTR_SECURE maps to the Linux "security" namespace, which is
 		// how these attributes appear to getfattr and to every tool that
 		// matches on names such as "security.selinux".
-		return "security.", "security", nil
+		return XattrNamespaceSecurity + namespaceSeparator, XattrNamespaceSecurity, nil
 	default:
 		return "", "", wrapParseError(0, "xattr_flags", ErrUnsupportedXattrFormat)
 	}
@@ -94,7 +94,7 @@ func (v *Volume) parseAttributesFromBlockNumber(inode *Inode, blockNumber uint32
 		return nil, err
 	}
 
-	if len(blockData) < 12 {
+	if len(blockData) < daBlockInfoSizeV4 {
 		return nil, wrapParseError(0, "xattr_block_header", ErrInvalidAttributeData)
 	}
 
@@ -103,10 +103,10 @@ func (v *Volume) parseAttributesFromBlockNumber(inode *Inode, blockNumber uint32
 		return nil, wrapParseError(8, "xattr_block_signature", ErrInvalidAttributeData)
 	}
 
-	if sig == 0x3bee || sig == 0xfbee {
+	if sig == xattrLeafMagicV5 || sig == xattrLeafMagicV4 {
 		return v.parseLeafBlockAttributes(inode, blockData)
 	}
-	if sig == 0x3ebe || sig == 0xfebe {
+	if sig == daNodeMagicV5 || sig == daNodeMagicV4 {
 		subBlocks, err := parseBranchBlockPointers(blockData, v.ioh.formatVersion)
 		if err != nil {
 			return nil, err
@@ -145,7 +145,7 @@ func (v *Volume) readAttributesLogicalBlock(inode *Inode, blockNumber uint32) ([
 
 	offset := int64(offBlocks * uint64(v.ioh.blockSize))
 	buf := make([]byte, v.ioh.blockSize)
-	if err := readAtFull(v.reader, buf, offset); err != nil {
+	if err := v.readAt(buf, offset); err != nil {
 		return nil, wrapIOError("read", offset, len(buf), err)
 	}
 	return buf, nil
@@ -162,10 +162,10 @@ func findAttributeExtentForLogicalBlock(extents []Extent, blockNumber uint64) *E
 }
 
 func parseBranchBlockPointers(data []byte, formatVersion uint8) ([]uint32, error) {
-	fsHeaderSize := 12
+	fsHeaderSize := daBlockInfoSizeV4
 	branchHeaderSize := 4
 	if formatVersion == 5 {
-		fsHeaderSize = 48
+		fsHeaderSize = xattrBlockHeaderSizeV5
 		branchHeaderSize = 8
 	}
 	if len(data) < fsHeaderSize+branchHeaderSize {
@@ -197,11 +197,11 @@ func parseBranchBlockPointers(data []byte, formatVersion uint8) ([]uint32, error
 
 func (v *Volume) parseLeafBlockAttributes(inode *Inode, data []byte) ([]ExtendedAttribute, error) {
 	formatVersion := v.ioh.formatVersion
-	fsHeaderSize := 12
-	leafHeaderSize := 20
+	fsHeaderSize := daBlockInfoSizeV4
+	leafHeaderSize := xattrLeafHeaderSizeV4
 	if formatVersion == 5 {
-		fsHeaderSize = 48
-		leafHeaderSize = 24
+		fsHeaderSize = xattrBlockHeaderSizeV5
+		leafHeaderSize = xattrLeafHeaderSizeV5
 	}
 	if len(data) < fsHeaderSize+leafHeaderSize {
 		return nil, wrapParseError(0, "xattr_leaf_header", ErrInvalidAttributeData)
@@ -232,7 +232,7 @@ func (v *Volume) parseLeafBlockAttributes(inode *Inode, data []byte) ([]Extended
 			return nil, wrapParseError(int64(valuesOffset), "xattr_leaf_values_offset", ErrInvalidAttributeData)
 		}
 
-		isLocal := (flags & 0x01) != 0
+		isLocal := (flags & xattrFlagLocal) != 0
 		metaSize := 0
 		nameSize := 0
 		valueSize := 0
@@ -318,7 +318,8 @@ func (v *Volume) readRemoteAttributeValue(startInode *Inode, startBlock uint32, 
 		}
 
 		segment := block
-		if v.ioh.formatVersion == 5 && len(block) >= 48 && string(block[0:4]) == "XARM" {
+		if v.ioh.formatVersion == sbFormatVersion5 && len(block) >= xattrBlockHeaderSizeV5 &&
+			string(block[0:len(xattrRemoteValueMagic)]) == xattrRemoteValueMagic {
 			valueDataOffset, ok := readUint32BE(block, 4)
 			if !ok {
 				return nil, wrapParseError(4, "xattr_remote_value_offset", ErrInvalidAttributeData)
@@ -330,7 +331,7 @@ func (v *Volume) readRemoteAttributeValue(startInode *Inode, startBlock uint32, 
 
 			off := int(valueDataOffset)
 			sz := int(valueDataSize)
-			if off < 48 || off > len(block) || sz < 0 || off+sz > len(block) {
+			if off < xattrBlockHeaderSizeV5 || off > len(block) || sz < 0 || off+sz > len(block) {
 				return nil, wrapParseError(int64(off), "xattr_remote_value_bounds", ErrInvalidAttributeData)
 			}
 			segment = block[off : off+sz]

@@ -2,36 +2,31 @@ package libxfs
 
 import "fmt"
 
-const (
-	extentLogicalBlockMask  = uint64(0x3fffffffffffff)
-	extentStartBlockLowMask = uint64(0x7ffffffffff)
-)
-
 func parseExtent(data []byte) (*Extent, error) {
-	if len(data) < 16 {
+	const upperWordOffset, lowerWordOffset = 0, 8
+
+	if len(data) < extentRecordSize {
 		return nil, wrapParseError(0, "extent", ErrInvalidInode)
 	}
 
-	valueUpper, ok := readUint64BE(data, 0)
+	valueUpper, ok := readUint64BE(data, upperWordOffset)
 	if !ok {
-		return nil, wrapParseError(0, "extent_upper", ErrInvalidInode)
+		return nil, wrapParseError(upperWordOffset, "extent_upper", ErrInvalidInode)
 	}
-	valueLower, ok := readUint64BE(data, 8)
+	valueLower, ok := readUint64BE(data, lowerWordOffset)
 	if !ok {
-		return nil, wrapParseError(8, "extent_lower", ErrInvalidInode)
+		return nil, wrapParseError(lowerWordOffset, "extent_lower", ErrInvalidInode)
 	}
 
-	numberOfBlocks := uint32(valueLower & 0x1fffff)
-	startBlockLow := (valueLower >> 21) & extentStartBlockLowMask
-	startBlockHigh := valueUpper & 0x1ff
-	physicalBlockNumber := (startBlockHigh << 43) | startBlockLow
+	numberOfBlocks := uint32(valueLower & extentBlockCountMask)
+	startBlockLow := (valueLower >> extentBlockCountBits) & extentStartLowMask
+	startBlockHigh := valueUpper & extentStartHighMask
+	physicalBlockNumber := (startBlockHigh << extentStartLowBits) | startBlockLow
 
-	logicalBlockNumber := (valueUpper >> 9) & extentLogicalBlockMask
-
-	valueUpper >>= 63
+	logicalBlockNumber := (valueUpper >> extentLogicalBlockPos) & extentLogicalMask
 
 	rangeFlags := uint32(0)
-	if valueUpper != 0 {
+	if valueUpper>>extentUnwrittenShift != 0 {
 		rangeFlags = ExtentFlagSparse
 	}
 
@@ -44,12 +39,12 @@ func parseExtent(data []byte) (*Extent, error) {
 }
 
 func inferExtentCount(data []byte) uint32 {
-	if len(data) < 16 {
+	if len(data) < extentRecordSize {
 		return 0
 	}
 
 	count := uint32(0)
-	for off := 0; off+16 <= len(data); off += 16 {
+	for off := 0; off+extentRecordSize <= len(data); off += extentRecordSize {
 		upper, okUpper := readUint64BE(data, off)
 		lower, okLower := readUint64BE(data, off+8)
 		if !okUpper || !okLower {
@@ -59,7 +54,7 @@ func inferExtentCount(data []byte) uint32 {
 			break
 		}
 
-		numberOfBlocks := uint32(lower & 0x1fffff)
+		numberOfBlocks := uint32(lower & extentBlockCountMask)
 		if numberOfBlocks == 0 {
 			break
 		}
@@ -70,7 +65,7 @@ func inferExtentCount(data []byte) uint32 {
 }
 
 func parseExtentList(numberOfBlocks uint64, numberOfExtents uint32, data []byte, addSparseExtents bool) ([]Extent, error) {
-	if int(numberOfExtents) > len(data)/16 {
+	if int(numberOfExtents) > len(data)/extentRecordSize {
 		return nil, wrapParseError(0, "number_of_extents", ErrInvalidInode)
 	}
 
@@ -78,8 +73,8 @@ func parseExtentList(numberOfBlocks uint64, numberOfExtents uint32, data []byte,
 	logicalBlockNumber := uint64(0)
 
 	for i := uint32(0); i < numberOfExtents; i++ {
-		off := int(i) * 16
-		extent, err := parseExtent(data[off : off+16])
+		off := int(i) * extentRecordSize
+		extent, err := parseExtent(data[off : off+extentRecordSize])
 		if err != nil {
 			return nil, fmt.Errorf("extent[%d]: %w", i, err)
 		}

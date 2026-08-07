@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
 
 // Default safety caps applied when DirectoryScanOptions leaves them unset.
@@ -129,6 +130,58 @@ func (v *Volume) validateDirectoryBlockSize() (uint64, error) {
 		return 0, wrapParseError(int64(size), "directory_block_size", ErrInvalidSuperblock)
 	}
 	return uint64(size), nil
+}
+
+// inodeAllocationState reports whether an inode number is structurally usable
+// on this filesystem, and if so whether the inode b-tree considers it
+// allocated.
+//
+// A carved candidate's inode number is just bytes recovered from reclaimed
+// space, so a number that cannot address anything on this volume is strong
+// evidence that the match is a coincidence.
+func (v *Volume) inodeAllocationState(inodeNumber uint64) (addressable bool, allocated bool) {
+	if inodeNumber == 0 || inodeNumber > math.MaxUint32 {
+		return false, false
+	}
+	bits := v.ioh.relativeInodeNumberBits
+	if bits == 0 || bits >= maxRelativeInodeBits {
+		return false, false
+	}
+
+	allocationGroupIndex := int(inodeNumber >> bits)
+	relativeInodeNumber := inodeNumber & ((uint64(1) << bits) - 1)
+	if allocationGroupIndex < 0 || allocationGroupIndex >= len(v.agInode) {
+		return false, false
+	}
+
+	found, err := v.hasRelativeInodeInBtree(allocationGroupIndex, relativeInodeNumber)
+	if err != nil {
+		// The number is addressable; we simply could not confirm its state.
+		return true, false
+	}
+	return true, found
+}
+
+// refineCarvedRecord adjusts a carved candidate's confidence using context the
+// block parser does not have: whether the recovered inode number can address
+// anything on this volume, and what the inode b-tree says about it.
+//
+// A deleted entry's inode is usually freed, so "unallocated" is consistent
+// with genuine deletion and "allocated" may mean the number has since been
+// reused. Neither is treated as proof; both are recorded as evidence.
+func (v *Volume) refineCarvedRecord(record *DirectoryRecord) {
+	addressable, allocated := v.inodeAllocationState(record.InodeNumber)
+
+	if !addressable {
+		record.Confidence = ConfidenceLow
+		record.ConfidenceReasons = append(record.ConfidenceReasons, ReasonInodeUnaddressable)
+		return
+	}
+	if allocated {
+		record.ConfidenceReasons = append(record.ConfidenceReasons, ReasonInodeAllocated)
+	} else {
+		record.ConfidenceReasons = append(record.ConfidenceReasons, ReasonInodeUnallocated)
+	}
 }
 
 // readDirectoryBlock reads a single directory block from a directory inode.
@@ -358,6 +411,9 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 			// A plain listing never surfaces Records, so building them would
 			// double the allocation for the hottest path in the library.
 			if options.IncludeDeleted {
+				if record.Kind == RecordKindCarved {
+					v.refineCarvedRecord(&record)
+				}
 				listing.Records = append(listing.Records, record)
 			}
 			if record.Kind == RecordKindActive {

@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+// secondaryFeatureFlagFileType is XFS_SB_VERSION2_FTYPEBIT: directory entries
+// carry an ftype byte. On v5 filesystems ftype is always present.
 const secondaryFeatureFlagFileType = 0x00000200
 
 // maxPathTraversalDepth bounds path resolution so that a crafted image cannot
@@ -195,17 +197,9 @@ func (v *Volume) ResolveInodeByPath(path string) (uint64, error) {
 		if part == "" || part == "." {
 			continue
 		}
-		entries, err := v.ListDirectoryEntries(current)
+		next, err := v.lookupDirectoryEntry(current, part)
 		if err != nil {
 			return 0, err
-		}
-
-		next := uint64(0)
-		for _, entry := range entries {
-			if entry.Name == part {
-				next = entry.InodeNumber
-				break
-			}
 		}
 		if next == 0 {
 			return 0, fmt.Errorf("%w: %s", ErrInodeNotFound, part)
@@ -217,6 +211,33 @@ func (v *Volume) ResolveInodeByPath(path string) (uint64, error) {
 		current = next
 	}
 	return current, nil
+}
+
+// lookupDirectoryEntry resolves one name within a directory, returning zero
+// when the name is not present.
+//
+// It tries the hash index first, which avoids reading every data block, and
+// falls back to a full linear walk whenever the index is absent, unreadable, or
+// does not produce a match. The fallback is mandatory: an index is an
+// optimisation, and an optimisation must never reduce what can be recovered
+// from a damaged image.
+func (v *Volume) lookupDirectoryEntry(directoryInode uint64, name string) (uint64, error) {
+	if inode, err := v.OpenInode(directoryInode); err == nil && inode.IsDirectory() {
+		if entry, ok := v.lookupDirectoryEntryByHash(inode, name); ok {
+			return entry.InodeNumber, nil
+		}
+	}
+
+	entries, err := v.ListDirectoryEntries(directoryInode)
+	if err != nil {
+		return 0, err
+	}
+	for _, entry := range entries {
+		if entry.Name == name {
+			return entry.InodeNumber, nil
+		}
+	}
+	return 0, nil
 }
 
 // shortFormDirectoryHeader is the fixed header of an inline directory.
@@ -231,7 +252,7 @@ type shortFormDirectoryHeader struct {
 // inline directory: count(1), i8count(1), parent(4 or 8).
 func parseShortFormDirectoryHeader(data []byte) (shortFormDirectoryHeader, error) {
 	header := shortFormDirectoryHeader{}
-	if len(data) < 6 {
+	if len(data) < shortFormHeaderSize32 {
 		return header, wrapParseError(0, "directory_header", ErrInvalidInode)
 	}
 
@@ -241,28 +262,28 @@ func parseShortFormDirectoryHeader(data []byte) (shortFormDirectoryHeader, error
 		return header, wrapParseError(0, "directory_header", ErrInvalidInode)
 	}
 
-	header.inodeNumberSize = 4
+	header.inodeNumberSize = shortFormInodeSize32
 	header.numberOfEntries = numberOf32BitEntries
-	header.headerSize = 6
+	header.headerSize = shortFormHeaderSize32
 	if numberOf64BitEntries != 0 {
-		header.inodeNumberSize = 8
+		header.inodeNumberSize = shortFormInodeSize64
 		header.numberOfEntries = numberOf64BitEntries
-		header.headerSize = 10
+		header.headerSize = shortFormHeaderSize64
 	}
 	if header.headerSize > len(data) {
 		return header, wrapParseError(int64(header.headerSize), "directory_header", ErrInvalidInode)
 	}
 
 	if header.inodeNumberSize == 4 {
-		parent, ok := readUint32BE(data, 2)
+		parent, ok := readUint32BE(data, shortFormOffsetParent)
 		if !ok {
-			return header, wrapParseError(2, "directory_parent_inode", ErrInvalidInode)
+			return header, wrapParseError(shortFormOffsetParent, "directory_parent_inode", ErrInvalidInode)
 		}
 		header.parentInodeNumber = uint64(parent)
 	} else {
-		parent, ok := readUint64BE(data, 2)
+		parent, ok := readUint64BE(data, shortFormOffsetParent)
 		if !ok {
-			return header, wrapParseError(2, "directory_parent_inode", ErrInvalidInode)
+			return header, wrapParseError(shortFormOffsetParent, "directory_parent_inode", ErrInvalidInode)
 		}
 		header.parentInodeNumber = parent
 	}

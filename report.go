@@ -1,6 +1,7 @@
 package libxfs
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -40,6 +41,10 @@ type ReportOptions struct {
 	// VerificationMode controls whether checksum/verification mismatches are
 	// fatal (`strict`) or recorded as anomalies (`best_effort`).
 	VerificationMode VerificationMode
+	// Concurrency optionally analyses discovered inodes in parallel. The
+	// zero value is sequential. Output is identical regardless of the
+	// worker count.
+	Concurrency Concurrency
 }
 
 // ReportAnomaly captures a parsing or consistency concern encountered while
@@ -137,7 +142,7 @@ func (r *XFSReport) Summary() string {
 	dirs := 0
 	files := 0
 	for _, file := range r.Files {
-		if file.Type == "directory" {
+		if file.Type == InodeTypeDirectory {
 			dirs++
 		} else {
 			files++
@@ -201,32 +206,32 @@ func (v *Volume) volumeIntegrityReportWithMode(mode VerificationMode) (VolumeInt
 	report.SuperblockCRCChecked = checked
 	report.SuperblockCRCValid = valid
 	if checked && !valid {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "VERIFY_SUPERBLOCK_CRC_MISMATCH", Severity: "high", Message: "v5 superblock CRC32c mismatch"})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "VERIFY_SUPERBLOCK_CRC_MISMATCH", Severity: SeverityHigh, Message: "v5 superblock CRC32c mismatch"})
 		if mode == VerificationModeStrict {
 			return report, ErrVerificationFailed
 		}
 	}
 	if crcErr != nil {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "VERIFY_SUPERBLOCK_CRC_ERROR", Severity: "medium", Message: crcErr.Error()})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "VERIFY_SUPERBLOCK_CRC_ERROR", Severity: SeverityMedium, Message: crcErr.Error()})
 		if mode == VerificationModeStrict {
 			return report, ErrVerificationFailed
 		}
 	}
 
 	if sb.BlockSize == 0 {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "INVALID_BLOCK_SIZE", Severity: "high", Message: "superblock block size is zero"})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "INVALID_BLOCK_SIZE", Severity: SeverityHigh, Message: "superblock block size is zero"})
 	}
 	if sb.InodeSize == 0 {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "INVALID_INODE_SIZE", Severity: "high", Message: "superblock inode size is zero"})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "INVALID_INODE_SIZE", Severity: SeverityHigh, Message: "superblock inode size is zero"})
 	}
 	if sb.DirectoryBlockSize == 0 {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "INVALID_DIR_BLOCK_SIZE", Severity: "high", Message: "superblock directory block size is zero"})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "INVALID_DIR_BLOCK_SIZE", Severity: SeverityHigh, Message: "superblock directory block size is zero"})
 	}
 	if sb.BlockSize != 0 && sb.DirectoryBlockSize%sb.BlockSize != 0 {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "DIR_BLOCK_ALIGNMENT", Severity: "medium", Message: "directory block size is not a multiple of filesystem block size"})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "DIR_BLOCK_ALIGNMENT", Severity: SeverityMedium, Message: "directory block size is not a multiple of filesystem block size"})
 	}
 	if _, err := v.GetRootInode(); err != nil {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "ROOT_INODE_OPEN_FAILED", Severity: "high", Message: err.Error(), Inode: sb.RootDirectoryInodeNumber})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "ROOT_INODE_OPEN_FAILED", Severity: SeverityHigh, Message: err.Error(), Inode: sb.RootDirectoryInodeNumber})
 	}
 
 	return report, nil
@@ -247,9 +252,9 @@ func (v *Volume) inodeForensicReportWithMode(inodeNumber uint64, mode Verificati
 		return InodeForensicReport{}, err
 	}
 
-	typeLabel := "file"
+	typeLabel := InodeTypeFile
 	if inode.IsDirectory() {
-		typeLabel = "directory"
+		typeLabel = InodeTypeDirectory
 	}
 
 	frag, fragErr := v.AnalyzeInodeFragmentation(inodeNumber)
@@ -295,13 +300,13 @@ func (v *Volume) inodeForensicReportWithMode(inodeNumber uint64, mode Verificati
 
 	checked, valid, crcErr := verifyInodeCRC(inode)
 	if checked && !valid {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "VERIFY_INODE_CRC_MISMATCH", Severity: "high", Message: "v3 inode CRC32c mismatch", Inode: inodeNumber})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "VERIFY_INODE_CRC_MISMATCH", Severity: SeverityHigh, Message: "v3 inode CRC32c mismatch", Inode: inodeNumber})
 		if mode == VerificationModeStrict {
 			return InodeForensicReport{}, ErrVerificationFailed
 		}
 	}
 	if crcErr != nil {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "VERIFY_INODE_CRC_ERROR", Severity: "medium", Message: crcErr.Error(), Inode: inodeNumber})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "VERIFY_INODE_CRC_ERROR", Severity: SeverityMedium, Message: crcErr.Error(), Inode: inodeNumber})
 		if mode == VerificationModeStrict {
 			return InodeForensicReport{}, ErrVerificationFailed
 		}
@@ -309,7 +314,7 @@ func (v *Volume) inodeForensicReportWithMode(inodeNumber uint64, mode Verificati
 
 	attrs, attrErr := v.ListInodeExtendedAttributes(inodeNumber)
 	if attrErr != nil {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "XATTR_SCAN_FAILED", Severity: "low", Message: attrErr.Error(), Inode: inodeNumber})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "XATTR_SCAN_FAILED", Severity: SeverityLow, Message: attrErr.Error(), Inode: inodeNumber})
 	} else {
 		names := make([]string, 0, len(attrs))
 		for _, attr := range attrs {
@@ -320,7 +325,7 @@ func (v *Volume) inodeForensicReportWithMode(inodeNumber uint64, mode Verificati
 	}
 
 	if fragErr != nil {
-		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "FRAGMENTATION_ANALYSIS_FAILED", Severity: "low", Message: fragErr.Error(), Inode: inodeNumber})
+		report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "FRAGMENTATION_ANALYSIS_FAILED", Severity: SeverityLow, Message: fragErr.Error(), Inode: inodeNumber})
 	}
 
 	return report, nil
@@ -368,7 +373,7 @@ func (v *Volume) directoryArtifactReportWithMode(inodeNumber uint64, mode Verifi
 	if listing.Truncated {
 		report.Anomalies = append(report.Anomalies, ReportAnomaly{
 			Code:     "DIRECTORY_SCAN_TRUNCATED",
-			Severity: "medium",
+			Severity: SeverityMedium,
 			Inode:    inodeNumber,
 			Message:  "directory scan hit a safety cap; records are incomplete",
 		})
@@ -406,9 +411,25 @@ func (v *Volume) Report() (*XFSReport, error) {
 }
 
 // ReportWithOptions builds a combined forensic report.
+//
+// It is equivalent to ReportWithContext with a background context.
 func (v *Volume) ReportWithOptions(options ReportOptions) (*XFSReport, error) {
+	return v.ReportWithContext(context.Background(), options)
+}
+
+// ReportWithContext builds a combined forensic report, honouring context
+// cancellation.
+//
+// Discovery of the inode set is sequential, because a directory must be read
+// before its children are known. Per-inode analysis then runs across the pool
+// configured by options.Concurrency. The result does not depend on the worker
+// count: entries are stored by position and sorted before returning.
+func (v *Volume) ReportWithContext(ctx context.Context, options ReportOptions) (*XFSReport, error) {
 	if v.IsClosed() {
 		return nil, ErrVolumeClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	mode := normalizeVerificationMode(options.VerificationMode)
@@ -441,80 +462,72 @@ func (v *Volume) ReportWithOptions(options ReportOptions) (*XFSReport, error) {
 			SuperblockCRCChecked: volumeReport.SuperblockCRCChecked,
 		},
 		Volume: volumeReport,
-		Files:  make([]InodeForensicReport, 0, 64),
+		Files:  make([]InodeForensicReport, 0, reportInitialCapacity),
 	}
 
-	type walkItem struct {
-		inode uint64
-		path  string
-	}
-	stack := []walkItem{{inode: rootInode, path: rootPath}}
-	visited := make(map[uint64]bool, 64)
+	discovered, discoveryAnomalies := v.discoverReportInodes(ctx, rootInode, rootPath, options)
+	report.Anomalies = append(report.Anomalies, discoveryAnomalies...)
 
-	for len(stack) > 0 {
-		if options.MaxEntries > 0 && len(report.Files) >= options.MaxEntries {
-			report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "MAX_ENTRIES_REACHED", Severity: "low", Message: fmt.Sprintf("report entry cap reached (%d)", options.MaxEntries)})
-			break
+	inodeReports := make([]InodeForensicReport, len(discovered))
+	artifactReports := make([]*DirectoryArtifactReport, len(discovered))
+	taskAnomalies := make([][]ReportAnomaly, len(discovered))
+
+	analyse := func(taskCtx context.Context, index int) error {
+		if err := taskCtx.Err(); err != nil {
+			return err
 		}
-
-		item := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		if visited[item.inode] {
-			continue
-		}
-		visited[item.inode] = true
+		item := discovered[index]
 
 		inodeReport, inodeErr := v.inodeForensicReportWithMode(item.inode, mode)
 		if inodeErr != nil {
-			report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "INODE_REPORT_FAILED", Severity: "medium", Message: inodeErr.Error(), Path: item.path, Inode: item.inode})
 			if mode == VerificationModeStrict {
-				return nil, inodeErr
+				return inodeErr
 			}
-			continue
-		}
-		if !report.Provenance.InodeCRCChecked {
-			if inodeObj, openErr := v.OpenInode(item.inode); openErr == nil && inodeObj.FormatVersion == 3 {
-				report.Provenance.InodeCRCChecked = true
-			}
+			taskAnomalies[index] = append(taskAnomalies[index], ReportAnomaly{
+				Code: "INODE_REPORT_FAILED", Severity: SeverityMedium,
+				Message: inodeErr.Error(), Path: item.path, Inode: item.inode,
+			})
+			return nil
 		}
 		inodeReport.Path = item.path
-		report.Files = append(report.Files, inodeReport)
+		inodeReports[index] = inodeReport
 
-		if inodeReport.Type != "directory" {
+		if !item.isDirectory || !options.IncludeDirectoryArtifacts {
+			return nil
+		}
+
+		dirReport, dirErr := v.directoryArtifactReportWithMode(item.inode, mode)
+		if dirErr != nil {
+			taskAnomalies[index] = append(taskAnomalies[index], ReportAnomaly{
+				Code: "DIRECTORY_ARTIFACT_SCAN_FAILED", Severity: SeverityLow,
+				Message: dirErr.Error(), Path: item.path, Inode: item.inode,
+			})
+			return nil
+		}
+		dirReport.Path = item.path
+		artifactReports[index] = &dirReport
+		return nil
+	}
+
+	if err := runBounded(ctx, options.Concurrency, len(discovered), analyse); err != nil {
+		return nil, err
+	}
+
+	// Collect in discovery order so the result is independent of scheduling.
+	for index, item := range discovered {
+		report.Anomalies = append(report.Anomalies, taskAnomalies[index]...)
+		if inodeReports[index].InodeNumber == 0 {
 			continue
 		}
-
-		if options.IncludeDirectoryArtifacts {
-			dirReport, dirErr := v.directoryArtifactReportWithMode(item.inode, mode)
-			if dirErr != nil {
-				report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "DIRECTORY_ARTIFACT_SCAN_FAILED", Severity: "low", Message: dirErr.Error(), Path: item.path, Inode: item.inode})
-			} else {
-				dirReport.Path = item.path
-				report.DirectoryArtifacts = append(report.DirectoryArtifacts, dirReport)
-			}
+		report.Files = append(report.Files, inodeReports[index])
+		if artifactReports[index] != nil {
+			report.DirectoryArtifacts = append(report.DirectoryArtifacts, *artifactReports[index])
 		}
-
-		entries, listErr := v.ListDirectoryEntries(item.inode)
-		if listErr != nil {
-			report.Anomalies = append(report.Anomalies, ReportAnomaly{Code: "DIRECTORY_LIST_FAILED", Severity: "medium", Message: listErr.Error(), Path: item.path, Inode: item.inode})
-			continue
-		}
-
-		sort.Slice(entries, func(i, j int) bool {
-			if entries[i].Name == entries[j].Name {
-				return entries[i].InodeNumber < entries[j].InodeNumber
+		if !report.Provenance.InodeCRCChecked {
+			if inodeObj, openErr := v.OpenInode(item.inode); openErr == nil &&
+				inodeObj.FormatVersion == inodeVersion3 {
+				report.Provenance.InodeCRCChecked = true
 			}
-			return entries[i].Name < entries[j].Name
-		})
-
-		for i := len(entries) - 1; i >= 0; i-- {
-			entry := entries[i]
-			if entry.Name == "." || entry.Name == ".." {
-				continue
-			}
-			nextPath := joinPath(item.path, entry.Name)
-			stack = append(stack, walkItem{inode: entry.InodeNumber, path: nextPath})
 		}
 	}
 
@@ -535,6 +548,93 @@ func (v *Volume) ReportWithOptions(options ReportOptions) (*XFSReport, error) {
 	return report, nil
 }
 
+// reportWalkItem is one inode discovered during the sequential tree walk.
+type reportWalkItem struct {
+	inode       uint64
+	path        string
+	isDirectory bool
+}
+
+// discoverReportInodes walks the tree from root and returns the inodes to
+// analyse, in a deterministic order.
+//
+// This phase stays sequential by necessity: a directory has to be read before
+// its children are known. It performs no per-inode analysis, so it is cheap
+// relative to the parallel phase that follows.
+func (v *Volume) discoverReportInodes(ctx context.Context, rootInode uint64, rootPath string,
+	options ReportOptions) ([]reportWalkItem, []ReportAnomaly) {
+
+	var discovered []reportWalkItem
+	var anomalies []ReportAnomaly
+
+	stack := []reportWalkItem{{inode: rootInode, path: rootPath}}
+	visited := make(map[uint64]bool, reportInitialCapacity)
+
+	for len(stack) > 0 {
+		if err := ctx.Err(); err != nil {
+			return discovered, anomalies
+		}
+		if options.MaxEntries > 0 && len(discovered) >= options.MaxEntries {
+			anomalies = append(anomalies, ReportAnomaly{
+				Code: "MAX_ENTRIES_REACHED", Severity: SeverityLow,
+				Message: fmt.Sprintf("report entry cap reached (%d)", options.MaxEntries),
+			})
+			break
+		}
+
+		item := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if visited[item.inode] {
+			continue
+		}
+		visited[item.inode] = true
+
+		inode, err := v.OpenInode(item.inode)
+		if err != nil {
+			anomalies = append(anomalies, ReportAnomaly{
+				Code: "INODE_OPEN_FAILED", Severity: SeverityMedium,
+				Message: err.Error(), Path: item.path, Inode: item.inode,
+			})
+			continue
+		}
+		item.isDirectory = inode.IsDirectory()
+		discovered = append(discovered, item)
+
+		if !item.isDirectory {
+			continue
+		}
+
+		entries, listErr := v.ListDirectoryEntries(item.inode)
+		if listErr != nil {
+			anomalies = append(anomalies, ReportAnomaly{
+				Code: "DIRECTORY_LIST_FAILED", Severity: SeverityMedium,
+				Message: listErr.Error(), Path: item.path, Inode: item.inode,
+			})
+			continue
+		}
+
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].Name == entries[j].Name {
+				return entries[i].InodeNumber < entries[j].InodeNumber
+			}
+			return entries[i].Name < entries[j].Name
+		})
+
+		for i := len(entries) - 1; i >= 0; i-- {
+			entry := entries[i]
+			if entry.Name == "." || entry.Name == ".." {
+				continue
+			}
+			stack = append(stack, reportWalkItem{
+				inode: entry.InodeNumber,
+				path:  joinPath(item.path, entry.Name),
+			})
+		}
+	}
+	return discovered, anomalies
+}
+
 func normalizeVerificationMode(mode VerificationMode) VerificationMode {
 	if mode == VerificationModeStrict {
 		return VerificationModeStrict
@@ -548,14 +648,14 @@ func (v *Volume) verifySuperblockCRC() (bool, bool, error) {
 	}
 
 	buf := make([]byte, superblockSize)
-	if err := readAtFull(v.reader, buf, 0); err != nil {
+	if err := v.readAt(buf, 0); err != nil {
 		return true, false, wrapIOError("read", 0, len(buf), err)
 	}
-	if len(buf) < 228 {
+	if len(buf) < sbOffsetChecksum+checksumSize {
 		return true, false, wrapParseError(0, "superblock_crc", ErrInvalidSuperblock)
 	}
 
-	expected := binary.BigEndian.Uint32(buf[224:228])
+	expected := binary.BigEndian.Uint32(buf[sbOffsetChecksum : sbOffsetChecksum+checksumSize])
 	actual := computeCRC32cWithZeroedField(buf, 224)
 	return true, actual == expected, nil
 }

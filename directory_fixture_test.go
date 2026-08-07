@@ -63,6 +63,17 @@ type fixtureImage struct {
 	// Blocks 0..7 are reserved for the superblock, AGI and inode area.
 	nextBlock        uint64
 	featuresIncompat uint32
+	// lastLeafStartBlock records where the most recent addLeafDirectory placed
+	// the leaf space, so a test can rewrite a leaf block after learning the
+	// logical block numbers of its children.
+	lastLeafStartBlock uint64
+}
+
+// leafBlockDiskOffset returns the byte offset of a leaf block written by the
+// most recent addLeafDirectory call.
+func (f *fixtureImage) leafBlockDiskOffset(index int) uint64 {
+	blocksPerDirBlock := uint64(f.dirBlockSize) / uint64(f.blockSize)
+	return (f.lastLeafStartBlock + uint64(index)*blocksPerDirBlock) * uint64(f.blockSize)
 }
 
 // newFixtureImage builds an empty image. dirBlockLog is log2 of the number of
@@ -295,6 +306,142 @@ func (f *fixtureImage) addBtreeDirectory(inodeNumber uint64, blocks [][]byte) {
 	binary.BigEndian.PutUint16(f.data[forkOffset+2:forkOffset+4], 1)
 	pointerOffset := forkOffset + 4 + (forkSize-4)/16*8
 	binary.BigEndian.PutUint64(f.data[pointerOffset:pointerOffset+8], nodeBlock)
+}
+
+// fixtureHashName is xfs_da_hashname, implemented independently of the parser
+// so that a regression in the parser's hash cannot be mirrored by the fixture.
+func fixtureHashName(name string) uint32 {
+	rol := func(value uint32, count uint) uint32 {
+		return value<<count | value>>(32-count)
+	}
+	var hash uint32
+	bytes := []byte(name)
+	i := 0
+	for ; len(bytes)-i >= 4; i += 4 {
+		hash = uint32(bytes[i])<<21 ^ uint32(bytes[i+1])<<14 ^
+			uint32(bytes[i+2])<<7 ^ uint32(bytes[i+3]) ^ rol(hash, 28)
+	}
+	switch len(bytes) - i {
+	case 3:
+		return uint32(bytes[i])<<14 ^ uint32(bytes[i+1])<<7 ^ uint32(bytes[i+2]) ^ rol(hash, 21)
+	case 2:
+		return uint32(bytes[i])<<7 ^ uint32(bytes[i+1]) ^ rol(hash, 14)
+	case 1:
+		return uint32(bytes[i]) ^ rol(hash, 7)
+	}
+	return hash
+}
+
+// fixtureLeafEntry is one hash-index entry to place in a leaf block.
+type fixtureLeafEntry struct {
+	hash uint32
+	// address is the entry's byte offset in the data space divided by 8.
+	address uint32
+}
+
+// buildDirectoryLeafBlock lays out a leaf block holding a hash index.
+//
+// Header layout, derived independently of the parser: v4 leaf headers are
+// xfs_da_blkinfo(12) + count(2) + stale(2); v5 add the CRC block info, giving
+// da3_blkinfo(56) + count(2) + stale(2) + pad(4).
+func (f *fixtureImage) buildDirectoryLeafBlock(entries []fixtureLeafEntry, leafN bool) []byte {
+	block := make([]byte, f.dirBlockSize)
+
+	headerSize := 16
+	magic := uint16(0xd2f1) // XFS_DIR2_LEAF1_MAGIC
+	if leafN {
+		magic = 0xd2ff // XFS_DIR2_LEAFN_MAGIC
+	}
+	if f.formatVersion == 5 {
+		headerSize = 64
+		magic = 0x3df1 // XFS_DIR3_LEAF1_MAGIC
+		if leafN {
+			magic = 0x3dff // XFS_DIR3_LEAFN_MAGIC
+		}
+	}
+
+	binary.BigEndian.PutUint16(block[8:10], magic)
+	binary.BigEndian.PutUint16(block[headerSize-4:headerSize-2], uint16(len(entries)))
+	binary.BigEndian.PutUint16(block[headerSize-2:headerSize], 0) // stale
+
+	for i, entry := range entries {
+		offset := headerSize + i*8
+		binary.BigEndian.PutUint32(block[offset:offset+4], entry.hash)
+		binary.BigEndian.PutUint32(block[offset+4:offset+8], entry.address)
+	}
+	return block
+}
+
+// buildDirectoryNodeBlock lays out an interior da node block pointing at
+// children, which are logical filesystem-block numbers within the directory.
+func (f *fixtureImage) buildDirectoryNodeBlock(children []uint32, level uint16) []byte {
+	block := make([]byte, f.dirBlockSize)
+
+	headerSize := 16
+	magic := uint16(0xfebe) // XFS_DA_NODE_MAGIC
+	if f.formatVersion == 5 {
+		headerSize = 64
+		magic = 0x3ebe // XFS_DA3_NODE_MAGIC
+	}
+
+	binary.BigEndian.PutUint16(block[8:10], magic)
+	countOffset := 12
+	if f.formatVersion == 5 {
+		countOffset = 56
+	}
+	binary.BigEndian.PutUint16(block[countOffset:countOffset+2], uint16(len(children)))
+	binary.BigEndian.PutUint16(block[countOffset+2:countOffset+4], level)
+
+	for i, child := range children {
+		offset := headerSize + i*8
+		binary.BigEndian.PutUint32(block[offset:offset+4], 0) // hashval
+		binary.BigEndian.PutUint32(block[offset+4:offset+8], child)
+	}
+	return block
+}
+
+// fixtureLeafSpaceFirstBlock is the logical filesystem-block number at which
+// the directory leaf space begins: 32 GiB / blocksize.
+func (f *fixtureImage) leafSpaceFirstBlock() uint64 {
+	return (uint64(1) << 35) / uint64(f.blockSize)
+}
+
+// addLeafDirectory writes a directory with both a data region and a hash index
+// in the leaf space at 32 GiB, mapped by a second extent.
+//
+// leafBlocks are placed consecutively from the leaf-space origin. Their logical
+// block numbers, which node entries reference, are returned.
+func (f *fixtureImage) addLeafDirectory(inodeNumber uint64, dataBlocks [][]byte, leafBlocks [][]byte) []uint32 {
+	blocksPerDirBlock := uint64(f.dirBlockSize) / uint64(f.blockSize)
+
+	dataBlockCount := uint64(len(dataBlocks)) * blocksPerDirBlock
+	dataStart := f.allocateBlocks(dataBlockCount)
+	for i, block := range dataBlocks {
+		offset := (dataStart + uint64(i)*blocksPerDirBlock) * uint64(f.blockSize)
+		f.writeAt(offset, block)
+	}
+
+	leafBlockCount := uint64(len(leafBlocks)) * blocksPerDirBlock
+	leafStart := f.allocateBlocks(leafBlockCount)
+	f.lastLeafStartBlock = leafStart
+	logicalNumbers := make([]uint32, 0, len(leafBlocks))
+	for i, block := range leafBlocks {
+		offset := (leafStart + uint64(i)*blocksPerDirBlock) * uint64(f.blockSize)
+		f.writeAt(offset, block)
+		logicalNumbers = append(logicalNumbers,
+			uint32(f.leafSpaceFirstBlock()+uint64(i)*blocksPerDirBlock))
+	}
+
+	// di_size covers the data space only; the leaf space sits above it.
+	size := uint64(len(dataBlocks)) * uint64(f.dirBlockSize)
+	forkOffset := f.writeInode(inodeNumber, FileTypeDirectory|0755, ForkTypeExtents, size, 2)
+
+	dataExtent := encodeExtent(0, dataStart, uint32(dataBlockCount), false)
+	f.writeAt(forkOffset, dataExtent[:])
+	leafExtent := encodeExtent(f.leafSpaceFirstBlock(), leafStart, uint32(leafBlockCount), false)
+	f.writeAt(forkOffset+16, leafExtent[:])
+
+	return logicalNumbers
 }
 
 // setAttributeExtentCount writes the attribute fork extent count at whichever

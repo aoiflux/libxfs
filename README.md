@@ -134,6 +134,8 @@ Forensics:
 - `(*Volume).ScanDirectoryRecordsByPath(path string) ([]DirectoryRecord, error)`
 - `(*Volume).ScanDirectoryRecordsWithOptions(inodeNumber uint64, options DirectoryScanOptions) (DirectoryListing, error)`
 - `(*Volume).ScanDirectoryRecordsByPathWithOptions(path string, options DirectoryScanOptions) (DirectoryListing, error)`
+- `(*Volume).VerifyDirectoryIndex(inodeNumber uint64) (DirectoryIndexReport, error)`
+- `(*Volume).VerifyDirectoryIndexByPath(path string) (DirectoryIndexReport, error)`
 - `(*Volume).VolumeIntegrityReport() (VolumeIntegrityReport, error)`
 - `(*Volume).InodeForensicReport(inodeNumber uint64) (InodeForensicReport, error)`
 - `(*Volume).InodeForensicReportByPath(path string) (InodeForensicReport, error)`
@@ -177,6 +179,24 @@ forensic output can show its reasoning rather than assert a verdict.
 
 Every record is addressable within the directory stream via `BlockIndex` and
 `LogicalOffset`; `Offset` is only meaningful within its own directory block.
+
+### Directory index verification
+
+Leaf and node format directories carry a hash index alongside their entries.
+The kernel maintains both together, so disagreement between them means
+something modified the directory without maintaining both.
+
+```go
+report, err := vol.VerifyDirectoryIndex(ino)
+if err == nil && report.HasIndex && !report.Consistent() {
+    // report.MissingFromIndex, report.HashMismatches, report.DanglingIndexEntries
+}
+```
+
+Directories with no index — short-form and single-block — report `HasIndex`
+false and are consistent by definition. Path resolution uses the index when it
+is present and falls back to a linear walk whenever it is absent, unreadable,
+or inconsistent; an index never reduces what can be recovered.
 
 ### Damaged directories
 

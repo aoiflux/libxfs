@@ -1,6 +1,9 @@
 package libxfs
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math"
+)
 
 func readUint16BE(data []byte, off int) (uint16, bool) {
 	if off < 0 || off+2 > len(data) {
@@ -41,15 +44,15 @@ func signedSecondsWithNanos(seconds uint32, nanos uint32) int64 {
 // saturateUint32 narrows a count, clamping rather than wrapping so that an
 // overflowed value can never read as a small one.
 func saturateUint32(value uint64) uint32 {
-	if value > 0xffffffff {
-		return 0xffffffff
+	if value > math.MaxUint32 {
+		return math.MaxUint32
 	}
 	return uint32(value)
 }
 
 func saturateUint16(value uint32) uint16 {
-	if value > 0xffff {
-		return 0xffff
+	if value > math.MaxUint16 {
+		return math.MaxUint16
 	}
 	return uint16(value)
 }

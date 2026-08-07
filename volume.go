@@ -33,8 +33,10 @@ type Volume struct {
 	inodeCache   map[uint64]*Inode
 	inodeCacheMu sync.RWMutex
 
+	// closed and the backing reader are guarded by stateMu. See
+	// volume_access.go for the concurrency model.
 	closed  bool
-	closeMu sync.RWMutex
+	stateMu sync.RWMutex
 }
 
 // inodeFeatures returns the superblock feature bits that change inode layout.
@@ -45,18 +47,21 @@ func (v *Volume) inodeFeatures() inodeFeatures {
 	}
 }
 
+// Close releases the volume.
+//
+// It waits for in-flight reads to finish before releasing the backing reader,
+// so it is safe to call concurrently with reads. Subsequent operations return
+// ErrVolumeClosed. Closing an already closed volume returns ErrVolumeClosed.
 func (v *Volume) Close() error {
-	v.closeMu.Lock()
-	defer v.closeMu.Unlock()
+	v.stateMu.Lock()
+	defer v.stateMu.Unlock()
 
 	if v.closed {
 		return ErrVolumeClosed
 	}
 	v.closed = true
 
-	v.inodeCacheMu.Lock()
-	v.inodeCache = nil
-	v.inodeCacheMu.Unlock()
+	v.clearInodeCache()
 
 	if v.sourceCloser != nil {
 		if err := v.sourceCloser.Close(); err != nil {
@@ -68,9 +73,13 @@ func (v *Volume) Close() error {
 	return nil
 }
 
+// IsClosed reports whether the volume has been closed.
+//
+// It is a point-in-time answer: on a volume shared with a goroutine that may
+// call Close, prefer acting on ErrVolumeClosed from the operation itself.
 func (v *Volume) IsClosed() bool {
-	v.closeMu.RLock()
-	defer v.closeMu.RUnlock()
+	v.stateMu.RLock()
+	defer v.stateMu.RUnlock()
 	return v.closed
 }
 
@@ -96,15 +105,12 @@ func (v *Volume) OpenInode(inodeNumber uint64) (*Inode, error) {
 		return nil, ErrInvalidInodeNumber
 	}
 
-	v.inodeCacheMu.RLock()
-	if inode, ok := v.inodeCache[inodeNumber]; ok {
-		v.inodeCacheMu.RUnlock()
-		return inode, nil
+	if cached := v.lookupCachedInode(inodeNumber); cached != nil {
+		return shallowCopyInode(cached), nil
 	}
-	v.inodeCacheMu.RUnlock()
 
 	bits := v.ioh.relativeInodeNumberBits
-	if bits == 0 || bits >= 32 {
+	if bits == 0 || bits >= maxRelativeInodeBits {
 		return nil, wrapVolumeError("open_inode", wrapParseError(0, "relative_inode_bits", ErrInvalidSuperblock))
 	}
 
@@ -127,7 +133,7 @@ func (v *Volume) OpenInode(inodeNumber uint64) (*Inode, error) {
 	offset := int64(agBlockNumber)*int64(v.ioh.blockSize) + int64(relativeInodeNumber)*int64(v.ioh.inodeSize)
 
 	buf := make([]byte, v.ioh.inodeSize)
-	if err := readAtFull(v.reader, buf, offset); err != nil {
+	if err := v.readAt(buf, offset); err != nil {
 		return nil, wrapIOError("read", offset, len(buf), err)
 	}
 
@@ -144,11 +150,9 @@ func (v *Volume) OpenInode(inodeNumber uint64) (*Inode, error) {
 		return nil, err
 	}
 
-	v.inodeCacheMu.Lock()
-	v.inodeCache[inodeNumber] = inode
-	v.inodeCacheMu.Unlock()
+	v.cacheInode(inodeNumber, inode)
 
-	return inode, nil
+	return shallowCopyInode(inode), nil
 }
 
 // ReadInodeData reads file data from an inode at offset.
@@ -319,7 +323,7 @@ func (v *Volume) readFromExtents(extents []Extent, totalSize uint64, p []byte, o
 
 		physicalBlock := extent.PhysicalBlockNumber + extentBlockIndex
 		diskOff := int64(physicalBlock*uint64(v.ioh.blockSize) + inBlockOffset)
-		if err := readAtFull(v.reader, p[written:written+int(toRead)], diskOff); err != nil {
+		if err := v.readAt(p[written:written+int(toRead)], diskOff); err != nil {
 			return written, wrapIOError("read", diskOff, int(toRead), err)
 		}
 		written += int(toRead)
@@ -467,7 +471,7 @@ func (v *Volume) getExtentsFromExtentBtreeBranchNode(numberOfRecords uint16, rec
 		return nil, wrapParseError(0, "extent_btree_recursion_depth", ErrInvalidInode)
 	}
 
-	numberOfKeyValuePairs := len(recordsData) / 16
+	numberOfKeyValuePairs := len(recordsData) / extentBtreeKeyPointerPairSize
 	if int(numberOfRecords) > numberOfKeyValuePairs {
 		return nil, wrapParseError(0, "extent_btree_branch_records", ErrInvalidInode)
 	}
@@ -512,7 +516,7 @@ func (v *Volume) getExtentsFromExtentBtreeNode(blockNumber uint64, addSparseExte
 	offset := int64(offsetBlocks * uint64(v.ioh.blockSize))
 
 	blockData := make([]byte, v.ioh.blockSize)
-	if err := readAtFull(v.reader, blockData, offset); err != nil {
+	if err := v.readAt(blockData, offset); err != nil {
 		return nil, wrapIOError("read", offset, len(blockData), err)
 	}
 
@@ -522,12 +526,12 @@ func (v *Volume) getExtentsFromExtentBtreeNode(blockNumber uint64, addSparseExte
 	}
 	recordsData := blockData[headerSize:]
 
-	if v.ioh.formatVersion == 5 {
-		if header.Signature != "BMA3" {
+	if v.ioh.formatVersion == sbFormatVersion5 {
+		if header.Signature != extentBtreeMagicV5 {
 			return nil, wrapParseError(offset, "extent_btree_signature", ErrInvalidInode)
 		}
 	} else {
-		if header.Signature != "BMAP" {
+		if header.Signature != extentBtreeMagicV4 {
 			return nil, wrapParseError(offset, "extent_btree_signature", ErrInvalidInode)
 		}
 	}
@@ -576,7 +580,7 @@ func (v *Volume) getRelativeInodeFromNode(allocationGroupBlockNumber uint64, rel
 	offset := int64(totalBlocks * uint64(v.ioh.blockSize))
 
 	blockData := make([]byte, v.ioh.blockSize)
-	if err := readAtFull(v.reader, blockData, offset); err != nil {
+	if err := v.readAt(blockData, offset); err != nil {
 		return false, wrapIOError("read", offset, len(blockData), err)
 	}
 
@@ -586,12 +590,12 @@ func (v *Volume) getRelativeInodeFromNode(allocationGroupBlockNumber uint64, rel
 	}
 	recordsData := blockData[headerSize:]
 
-	if v.ioh.formatVersion == 5 {
-		if header.Signature != "IAB3" {
+	if v.ioh.formatVersion == sbFormatVersion5 {
+		if header.Signature != inodeBtreeMagicV5 {
 			return false, wrapParseError(offset, "btree_signature", ErrInvalidInode)
 		}
 	} else {
-		if header.Signature != "IABT" {
+		if header.Signature != inodeBtreeMagicV4 {
 			return false, wrapParseError(offset, "btree_signature", ErrInvalidInode)
 		}
 	}
@@ -623,63 +627,60 @@ type btreeBlockHeader struct {
 }
 
 func parseBtreeBlockHeader(data []byte, formatVersion uint8, blockNumberDataSize int) (*btreeBlockHeader, int, error) {
-	if blockNumberDataSize != 4 && blockNumberDataSize != 8 {
+	if blockNumberDataSize != btreePointerSizeShort && blockNumberDataSize != btreePointerSizeLong {
 		return nil, 0, wrapParseError(0, "block_number_data_size", ErrInvalidInode)
 	}
 
-	headerSize := 0
-	if formatVersion == 5 {
-		if blockNumberDataSize == 8 {
-			headerSize = 72
-		} else {
-			headerSize = 56
-		}
-	} else {
-		if blockNumberDataSize == 8 {
-			headerSize = 24
-		} else {
-			headerSize = 16
-		}
+	longPointers := blockNumberDataSize == btreePointerSizeLong
+	headerSize := btreeHeaderSizeShortV4
+	switch {
+	case formatVersion == sbFormatVersion5 && longPointers:
+		headerSize = btreeHeaderSizeLongV5
+	case formatVersion == sbFormatVersion5:
+		headerSize = btreeHeaderSizeShortV5
+	case longPointers:
+		headerSize = btreeHeaderSizeLongV4
 	}
 	if len(data) < headerSize {
 		return nil, 0, wrapParseError(0, "btree_header", ErrInvalidInode)
 	}
 
-	level, ok := readUint16BE(data, 4)
+	level, ok := readUint16BE(data, btreeOffsetLevel)
 	if !ok {
-		return nil, 0, wrapParseError(4, "btree_level", ErrInvalidInode)
+		return nil, 0, wrapParseError(btreeOffsetLevel, "btree_level", ErrInvalidInode)
 	}
-	numberOfRecords, ok := readUint16BE(data, 6)
+	numberOfRecords, ok := readUint16BE(data, btreeOffsetRecordCount)
 	if !ok {
-		return nil, 0, wrapParseError(6, "btree_number_of_records", ErrInvalidInode)
+		return nil, 0, wrapParseError(btreeOffsetRecordCount, "btree_number_of_records", ErrInvalidInode)
 	}
 
 	return &btreeBlockHeader{
-		Signature:       string(data[0:4]),
+		Signature:       string(data[btreeOffsetMagic : btreeOffsetMagic+btreeMagicLength]),
 		Level:           level,
 		NumberOfRecords: numberOfRecords,
 	}, headerSize, nil
 }
 
 func inodeFoundInLeafRecords(recordsData []byte, numberOfRecords uint16, relativeInodeNumber uint64, offset int64) (bool, error) {
-	if int(numberOfRecords) > len(recordsData)/16 {
+	if int(numberOfRecords) > len(recordsData)/inobtRecordSize {
 		return false, wrapParseError(offset, "leaf_number_of_records", ErrInvalidInode)
 	}
 	for i := 0; i < int(numberOfRecords); i++ {
-		recordOffset := i * 16
-		inodeNumber, ok := readUint32BE(recordsData, recordOffset)
+		recordOffset := i * inobtRecordSize
+		inodeNumber, ok := readUint32BE(recordsData, recordOffset+inobtRecordOffsetStartInode)
 		if !ok {
 			return false, wrapParseError(offset+int64(recordOffset), "leaf_inode_number", ErrInvalidInode)
 		}
-		numberOfUnusedInodes, ok := readUint32BE(recordsData, recordOffset+4)
+		numberOfUnusedInodes, ok := readUint32BE(recordsData, recordOffset+inobtRecordOffsetFreeCount)
 		if !ok {
 			return false, wrapParseError(offset+int64(recordOffset+4), "leaf_unused_inode_count", ErrInvalidInode)
 		}
-		chunkAllocationBitmap, ok := readUint64BE(recordsData, recordOffset+8)
+		chunkAllocationBitmap, ok := readUint64BE(recordsData, recordOffset+inobtRecordOffsetFreeMask)
 		if !ok {
 			return false, wrapParseError(offset+int64(recordOffset+8), "leaf_chunk_bitmap", ErrInvalidInode)
 		}
-		if relativeInodeNumber >= uint64(inodeNumber) && relativeInodeNumber < uint64(inodeNumber)+64 {
+		if relativeInodeNumber >= uint64(inodeNumber) &&
+			relativeInodeNumber < uint64(inodeNumber)+inobtInodesPerChunk {
 			if !inodeAllocatedInChunk(relativeInodeNumber, uint64(inodeNumber), numberOfUnusedInodes, chunkAllocationBitmap) {
 				return false, nil
 			}
@@ -693,7 +694,8 @@ func inodeAllocatedInChunk(relativeInodeNumber uint64, chunkBaseInode uint64, nu
 	if numberOfUnusedInodes == 0 {
 		return true
 	}
-	if relativeInodeNumber < chunkBaseInode || relativeInodeNumber >= chunkBaseInode+64 {
+	if relativeInodeNumber < chunkBaseInode ||
+		relativeInodeNumber >= chunkBaseInode+inobtInodesPerChunk {
 		return false
 	}
 
@@ -737,7 +739,7 @@ func subBlockForRelativeInode(recordsData []byte, numberOfRecords uint16, relati
 
 func (v *Volume) parseAllocationGroups() error {
 	sbData := make([]byte, superblockSize)
-	if err := readAtFull(v.reader, sbData, 0); err != nil {
+	if err := v.readAt(sbData, 0); err != nil {
 		return wrapIOError("read", 0, superblockSize, err)
 	}
 
@@ -762,7 +764,7 @@ func (v *Volume) parseAllocationGroups() error {
 	v.agInode = make([]InodeInformation, 0, sb.NumberOfAllocationGroups)
 	for ag := uint32(0); ag < sb.NumberOfAllocationGroups; ag++ {
 		superblockOffset := int64(ag) * int64(sb.AllocationGroupSize) * int64(sb.BlockSize)
-		if err := readAtFull(v.reader, sbData, superblockOffset); err != nil {
+		if err := v.readAt(sbData, superblockOffset); err != nil {
 			return wrapIOError("read", superblockOffset, superblockSize, err)
 		}
 
@@ -776,7 +778,7 @@ func (v *Volume) parseAllocationGroups() error {
 
 		inodeInfoOffset := superblockOffset + int64(2*sb.SectorSize)
 		agiData := make([]byte, inodeInformationLen)
-		if err := readAtFull(v.reader, agiData, inodeInfoOffset); err != nil {
+		if err := v.readAt(agiData, inodeInfoOffset); err != nil {
 			return wrapIOError("read", inodeInfoOffset, inodeInformationLen, err)
 		}
 
@@ -789,89 +791,108 @@ func (v *Volume) parseAllocationGroups() error {
 	return nil
 }
 
+// isValidSectorSize reports whether a sector size is one XFS can use: a power
+// of two between the minimum and maximum the format allows.
+func isValidSectorSize(sectorSize uint16) bool {
+	if sectorSize < minSectorSize || sectorSize > maxSectorSize {
+		return false
+	}
+	return sectorSize&(sectorSize-1) == 0
+}
+
+// directoryBlockSizeFromLog derives the directory block size from
+// sb_dirblklog, which counts filesystem blocks per directory block as a power
+// of two.
+func directoryBlockSizeFromLog(blockSize uint32, directoryBlockLog uint8) (uint32, error) {
+	if directoryBlockLog == 0 {
+		return blockSize, nil
+	}
+	if uint32(directoryBlockLog) >= maxDirectoryBlockLog {
+		return 0, wrapParseError(sbOffsetDirectoryBlockLog, "directory_block_size_log2", ErrInvalidSuperblock)
+	}
+
+	multiplier := uint32(1) << directoryBlockLog
+	if multiplier > math.MaxUint32/blockSize {
+		return 0, wrapParseError(sbOffsetDirectoryBlockLog, "directory_block_size_log2", ErrInvalidSuperblock)
+	}
+	return multiplier * blockSize, nil
+}
+
 func parseSuperblock(data []byte) (*Superblock, error) {
 	if len(data) < superblockSize {
 		return nil, wrapParseError(0, "superblock", ErrInvalidSuperblock)
 	}
-	if !bytes.Equal(data[0:4], []byte(xfsSuperblockMagic)) {
-		return nil, wrapParseError(0, "signature", ErrInvalidSuperblock)
+	if !bytes.Equal(data[sbOffsetMagic:sbOffsetMagic+len(xfsSuperblockMagic)], []byte(xfsSuperblockMagic)) {
+		return nil, wrapParseError(sbOffsetMagic, "signature", ErrInvalidSuperblock)
 	}
 
-	blockSize, _ := readUint32BE(data, 4)
-	numberOfBlocks, _ := readUint64BE(data, 8)
-	journalBlockNumber, _ := readUint64BE(data, 48)
-	rootInode, _ := readUint64BE(data, 56)
-	allocationGroupSize, _ := readUint32BE(data, 84)
-	numberOfAllocationGroups, _ := readUint32BE(data, 88)
-	versionAndFlags, _ := readUint16BE(data, 100)
-	sectorSize, _ := readUint16BE(data, 102)
-	inodeSize, _ := readUint16BE(data, 104)
-	numberOfInodesPerBlock, _ := readUint16BE(data, 106)
-	secondaryFeatureFlags, _ := readUint32BE(data, 204)
+	blockSize, _ := readUint32BE(data, sbOffsetBlockSize)
+	numberOfBlocks, _ := readUint64BE(data, sbOffsetDataBlocks)
+	journalBlockNumber, _ := readUint64BE(data, sbOffsetLogStart)
+	rootInode, _ := readUint64BE(data, sbOffsetRootInode)
+	allocationGroupSize, _ := readUint32BE(data, sbOffsetAGBlocks)
+	numberOfAllocationGroups, _ := readUint32BE(data, sbOffsetAGCount)
+	versionAndFlags, _ := readUint16BE(data, sbOffsetVersionNumber)
+	sectorSize, _ := readUint16BE(data, sbOffsetSectorSize)
+	inodeSize, _ := readUint16BE(data, sbOffsetInodeSize)
+	numberOfInodesPerBlock, _ := readUint16BE(data, sbOffsetInodesPerBlock)
+	secondaryFeatureFlags, _ := readUint32BE(data, sbOffsetSecondaryFeatureFlags)
 
-	var volumeLabel [12]byte
-	copy(volumeLabel[:], data[108:120])
+	var volumeLabel [sbFilesystemNameLength]byte
+	copy(volumeLabel[:], data[sbOffsetFilesystemName:sbOffsetFilesystemName+sbFilesystemNameLength])
 
-	formatVersion := uint8(versionAndFlags & 0x000f)
-	featureFlags := versionAndFlags & 0xfff0
+	formatVersion := uint8(versionAndFlags & sbVersionMask)
+	featureFlags := versionAndFlags & sbFeatureFlagsMask
 
-	if formatVersion != 4 && formatVersion != 5 {
-		return nil, wrapParseError(100, "format_version", ErrInvalidSuperblock)
+	if formatVersion != sbFormatVersion4 && formatVersion != sbFormatVersion5 {
+		return nil, wrapParseError(sbOffsetVersionNumber, "format_version", ErrInvalidSuperblock)
 	}
 
-	supportedFeatureFlags := uint16(0x0010 | 0x0020 | 0x0080 | 0x0400 | 0x0800 | 0x1000 | 0x2000 | 0x4000 | 0x8000)
-	if featureFlags&^supportedFeatureFlags != 0 {
-		return nil, wrapParseError(100, "feature_flags", ErrUnsupportedFeatureFlag)
+	if featureFlags&^sbSupportedFeatureFlags != 0 {
+		return nil, wrapParseError(sbOffsetVersionNumber, "feature_flags", ErrUnsupportedFeatureFlag)
 	}
 
 	if blockSize < minBlockSize || blockSize > maxBlockSize {
-		return nil, wrapParseError(4, "block_size", ErrInvalidSuperblock)
+		return nil, wrapParseError(sbOffsetBlockSize, "block_size", ErrInvalidSuperblock)
 	}
-	if sectorSize != 512 && sectorSize != 1024 && sectorSize != 2048 && sectorSize != 4096 && sectorSize != 8192 && sectorSize != 16384 {
-		return nil, wrapParseError(102, "sector_size", ErrInvalidSuperblock)
+	if !isValidSectorSize(sectorSize) {
+		return nil, wrapParseError(sbOffsetSectorSize, "sector_size", ErrInvalidSuperblock)
 	}
 	if inodeSize < minInodeSize || inodeSize > maxInodeSize {
-		return nil, wrapParseError(104, "inode_size", ErrInvalidSuperblock)
+		return nil, wrapParseError(sbOffsetInodeSize, "inode_size", ErrInvalidSuperblock)
 	}
 
-	dirLog2 := uint32(data[192])
-	directoryBlockSize := blockSize
-	if dirLog2 != 0 {
-		if dirLog2 >= 32 {
-			return nil, wrapParseError(192, "directory_block_size_log2", ErrInvalidSuperblock)
-		}
-		directoryBlockSize = uint32(1) << dirLog2
-		if directoryBlockSize > math.MaxUint32/blockSize {
-			return nil, wrapParseError(192, "directory_block_size_log2", ErrInvalidSuperblock)
-		}
-		directoryBlockSize *= blockSize
+	directoryBlockSize, err := directoryBlockSizeFromLog(blockSize, data[sbOffsetDirectoryBlockLog])
+	if err != nil {
+		return nil, err
 	}
 
-	if allocationGroupSize < 5 || allocationGroupSize > math.MaxInt32 {
-		return nil, wrapParseError(84, "allocation_group_size", ErrInvalidSuperblock)
+	if allocationGroupSize < minAllocationGroupBlocks || allocationGroupSize > math.MaxInt32 {
+		return nil, wrapParseError(sbOffsetAGBlocks, "allocation_group_size", ErrInvalidSuperblock)
 	}
-	allocationGroupSizeLog2 := data[124]
-	if allocationGroupSizeLog2 == 0 || allocationGroupSizeLog2 > 31 {
-		return nil, wrapParseError(124, "allocation_group_size_log2", ErrInvalidSuperblock)
+	allocationGroupSizeLog2 := data[sbOffsetAGBlocksLog]
+	if allocationGroupSizeLog2 == 0 || allocationGroupSizeLog2 > maxAllocationGroupLog {
+		return nil, wrapParseError(sbOffsetAGBlocksLog, "allocation_group_size_log2", ErrInvalidSuperblock)
 	}
 
-	numberOfInodesPerBlockLog2 := data[123]
+	numberOfInodesPerBlockLog2 := data[sbOffsetInodesPerBlockLog]
 	relativeBlockBits := allocationGroupSizeLog2
-	if numberOfInodesPerBlockLog2 == 0 || int(numberOfInodesPerBlockLog2) > (32-int(relativeBlockBits)) {
-		return nil, wrapParseError(123, "number_of_inodes_per_block_log2", ErrInvalidSuperblock)
+	if numberOfInodesPerBlockLog2 == 0 ||
+		int(numberOfInodesPerBlockLog2) > (inodeAddressBits-int(relativeBlockBits)) {
+		return nil, wrapParseError(sbOffsetInodesPerBlockLog, "number_of_inodes_per_block_log2", ErrInvalidSuperblock)
 	}
 	relativeInodeBits := relativeBlockBits + numberOfInodesPerBlockLog2
-	if relativeInodeBits == 0 || relativeInodeBits >= 32 {
-		return nil, wrapParseError(123, "relative_inode_number_bits", ErrInvalidSuperblock)
+	if relativeInodeBits == 0 || relativeInodeBits >= maxRelativeInodeBits {
+		return nil, wrapParseError(sbOffsetInodesPerBlockLog, "relative_inode_number_bits", ErrInvalidSuperblock)
 	}
 	if uint16(1)<<numberOfInodesPerBlockLog2 != numberOfInodesPerBlock {
-		return nil, wrapParseError(106, "number_of_inodes_per_block", ErrInvalidSuperblock)
+		return nil, wrapParseError(sbOffsetInodesPerBlock, "number_of_inodes_per_block", ErrInvalidSuperblock)
 	}
 
 	// The feature words only exist on v5 superblocks; on v4 the space holds
 	// unrelated data and must not be interpreted.
 	var featuresCompat, featuresReadOnly, featuresIncompat, featuresLogIncompat uint32
-	if formatVersion == 5 {
+	if formatVersion == sbFormatVersion5 {
 		featuresCompat, _ = readUint32BE(data, superblockFeaturesCompatOffset)
 		featuresReadOnly, _ = readUint32BE(data, superblockFeaturesReadOnlyOffset)
 		featuresIncompat, _ = readUint32BE(data, superblockFeaturesIncompatOffset)
@@ -910,23 +931,21 @@ func parseSuperblock(data []byte) (*Superblock, error) {
 }
 
 func parseInodeInformation(data []byte, formatVersion uint8) (*InodeInformation, error) {
-	required := 0
-	if formatVersion >= 5 {
-		required = 512
-	} else {
-		required = 296
+	required := agiSizeV4
+	if formatVersion >= sbFormatVersion5 {
+		required = agiSizeV5
 	}
 	if len(data) < required {
 		return nil, wrapParseError(0, "inode_information", ErrInvalidInodeInfo)
 	}
-	if !bytes.Equal(data[0:4], []byte(xfsAGIMagic)) {
-		return nil, wrapParseError(0, "signature", ErrInvalidInodeInfo)
+	if !bytes.Equal(data[agiOffsetMagic:agiOffsetMagic+len(xfsAGIMagic)], []byte(xfsAGIMagic)) {
+		return nil, wrapParseError(agiOffsetMagic, "signature", ErrInvalidInodeInfo)
 	}
 
-	fv, _ := readUint32BE(data, 4)
-	root, _ := readUint32BE(data, 20)
-	depth, _ := readUint32BE(data, 24)
-	lastChunk, _ := readUint32BE(data, 32)
+	fv, _ := readUint32BE(data, agiOffsetVersion)
+	root, _ := readUint32BE(data, agiOffsetInodeBtreeRoot)
+	depth, _ := readUint32BE(data, agiOffsetInodeBtreeDepth)
+	lastChunk, _ := readUint32BE(data, agiOffsetLastAllocatedChunk)
 
 	return &InodeInformation{
 		FormatVersion:       fv,
@@ -947,42 +966,42 @@ func parseInode(data []byte, blockSize uint32, features inodeFeatures) (*Inode, 
 	if len(data) < minInodeSize {
 		return nil, wrapParseError(0, "inode", ErrInvalidInode)
 	}
-	if !bytes.Equal(data[0:2], []byte(xfsInodeMagic)) {
-		return nil, wrapParseError(0, "signature", ErrInvalidInode)
+	if !bytes.Equal(data[inodeOffsetMagic:inodeOffsetMagic+len(xfsInodeMagic)], []byte(xfsInodeMagic)) {
+		return nil, wrapParseError(inodeOffsetMagic, "signature", ErrInvalidInode)
 	}
 
-	formatVersion := data[4]
-	inodeHeaderSize := 100
-	if formatVersion == 3 {
-		inodeHeaderSize = 176
+	formatVersion := data[inodeOffsetVersion]
+	inodeHeaderSize := inodeHeaderSizeV2
+	if formatVersion == inodeVersion3 {
+		inodeHeaderSize = inodeHeaderSizeV3
 	}
 	if len(data) < inodeHeaderSize {
 		return nil, wrapParseError(0, "inode_header", ErrInvalidInode)
 	}
-	if formatVersion != 1 && formatVersion != 2 && formatVersion != 3 {
-		return nil, wrapParseError(4, "format_version", ErrInvalidInode)
+	if formatVersion != inodeVersion1 && formatVersion != inodeVersion2 && formatVersion != inodeVersion3 {
+		return nil, wrapParseError(inodeOffsetVersion, "format_version", ErrInvalidInode)
 	}
 
-	fileMode, _ := readUint16BE(data, 2)
-	forkType := data[5]
-	ownerID, _ := readUint32BE(data, 8)
-	groupID, _ := readUint32BE(data, 12)
+	fileMode, _ := readUint16BE(data, inodeOffsetMode)
+	forkType := data[inodeOffsetFormat]
+	ownerID, _ := readUint32BE(data, inodeOffsetUserID)
+	groupID, _ := readUint32BE(data, inodeOffsetGroupID)
 
 	var numberOfLinks uint32
-	if formatVersion == 1 {
-		v, _ := readUint16BE(data, 6)
+	if formatVersion == inodeVersion1 {
+		v, _ := readUint16BE(data, inodeOffsetLinkCountV1)
 		numberOfLinks = uint32(v)
 	} else {
-		numberOfLinks, _ = readUint32BE(data, 16)
+		numberOfLinks, _ = readUint32BE(data, inodeOffsetLinkCount)
 	}
 
 	// Bigtime only applies to v3 inodes; v1/v2 inodes always use the legacy
 	// encoding regardless of what the superblock advertises.
-	bigTime := features.bigTime && formatVersion == 3
+	bigTime := features.bigTime && formatVersion == inodeVersion3
 
-	size, _ := readUint64BE(data, 56)
-	attrForkOffset := uint16(data[82]) * 8
-	attrForkType := data[83]
+	size, _ := readUint64BE(data, inodeOffsetSize)
+	attrForkOffset := uint16(data[inodeOffsetAttributeForkShift]) * inodeAttributeForkShiftUnit
+	attrForkType := data[inodeOffsetAttributeFormat]
 
 	// With the nrext64 feature the extent counters move and widen: the data
 	// fork count becomes a 64-bit value in the padding at offset 24, and the
@@ -990,11 +1009,11 @@ func parseInode(data []byte, blockSize uint32, features inodeFeatures) (*Inode, 
 	var dataExtentCount uint64
 	var attrExtentCount uint32
 	if features.largeExtentCounts {
-		dataExtentCount, _ = readUint64BE(data, 24)
-		attrExtentCount, _ = readUint32BE(data, 76)
+		dataExtentCount, _ = readUint64BE(data, inodeOffsetBigExtentCount)
+		attrExtentCount, _ = readUint32BE(data, inodeOffsetExtentCount)
 	} else {
-		narrowData, _ := readUint32BE(data, 76)
-		narrowAttr, _ := readUint16BE(data, 80)
+		narrowData, _ := readUint32BE(data, inodeOffsetExtentCount)
+		narrowAttr, _ := readUint16BE(data, inodeOffsetAttributeExtents)
 		dataExtentCount = uint64(narrowData)
 		attrExtentCount = uint32(narrowAttr)
 	}
@@ -1006,9 +1025,9 @@ func parseInode(data []byte, blockSize uint32, features inodeFeatures) (*Inode, 
 		OwnerID:                  ownerID,
 		GroupID:                  groupID,
 		NumberOfLinks:            numberOfLinks,
-		AccessTimeNS:             readInodeTimestamp(data, 32, bigTime),
-		ModificationTimeNS:       readInodeTimestamp(data, 40, bigTime),
-		InodeChangeTimeNS:        readInodeTimestamp(data, 48, bigTime),
+		AccessTimeNS:             readInodeTimestamp(data, inodeOffsetAccessTime, bigTime),
+		ModificationTimeNS:       readInodeTimestamp(data, inodeOffsetModificationTime, bigTime),
+		InodeChangeTimeNS:        readInodeTimestamp(data, inodeOffsetChangeTime, bigTime),
 		Size:                     size,
 		NumberOfDataExtents:      saturateUint32(dataExtentCount),
 		NumberOfAttributesExtent: saturateUint16(attrExtentCount),
@@ -1019,14 +1038,14 @@ func parseInode(data []byte, blockSize uint32, features inodeFeatures) (*Inode, 
 		Raw:                      append([]byte(nil), data...),
 	}
 
-	if formatVersion == 3 {
-		inode.CreationTimeNS = readInodeTimestamp(data, 144, bigTime)
+	if formatVersion == inodeVersion3 {
+		inode.CreationTimeNS = readInodeTimestamp(data, inodeOffsetCreationTime, bigTime)
 	}
 
 	dataForkSize := len(data) - inodeHeaderSize
 	if attrForkOffset > 0 {
 		if int(attrForkOffset) >= dataForkSize {
-			return nil, wrapParseError(82, "attributes_fork_offset", ErrInvalidInode)
+			return nil, wrapParseError(inodeOffsetAttributeForkShift, "attributes_fork_offset", ErrInvalidInode)
 		}
 		dataForkSize = int(attrForkOffset)
 		inode.AttributesForkOffset = uint16(inodeHeaderSize) + attrForkOffset
@@ -1039,7 +1058,7 @@ func parseInode(data []byte, blockSize uint32, features inodeFeatures) (*Inode, 
 		return nil, wrapParseError(int64(inode.DataForkOffset), "inline_data_size", ErrInvalidInode)
 	}
 	if inode.ForkType == ForkTypeDevice {
-		if int(inode.DataForkOffset)+4 > len(data) {
+		if int(inode.DataForkOffset)+deviceIdentifierSize > len(data) {
 			return nil, wrapParseError(int64(inode.DataForkOffset), "device_identifier", ErrInvalidInode)
 		}
 		inode.DeviceIdentifier, _ = readUint32BE(data, int(inode.DataForkOffset))

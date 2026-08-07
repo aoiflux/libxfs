@@ -369,12 +369,16 @@ func carveDeletedDirectoryEntries(data []byte, slotOffset int, slotLength int, e
 			continue
 		}
 
-		reasons := []string{ReasonInFreeSlot, ReasonNamePrintable}
-		confidence := ConfidenceMedium
-
-		if cursor%dirDataAlign == 0 {
-			reasons = append(reasons, ReasonAlignedOffset)
+		// Directory entries are always 8-byte aligned. A printable name at an
+		// unaligned offset is a byte pattern that happens to look like a name,
+		// not a record, so it is not worth reporting as a candidate.
+		if cursor%dirDataAlign != 0 {
+			cursor++
+			continue
 		}
+
+		reasons := []string{ReasonInFreeSlot, ReasonNamePrintable, ReasonAlignedOffset}
+		confidence := ConfidenceMedium
 
 		fileType := DirEntryFileTypeUnknown
 		if ctx.hasFileType {
@@ -420,7 +424,7 @@ func looksLikeDirectoryName(name []byte) bool {
 		return false
 	}
 	for _, b := range name {
-		if b < 0x20 || b > 0x7e {
+		if b < printableASCIIMin || b > printableASCIIMax {
 			return false
 		}
 		if b == '/' || b == '\\' || b == 0 {

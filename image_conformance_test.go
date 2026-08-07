@@ -286,6 +286,67 @@ func TestImageDirectoryRecordsAreLabelled(t *testing.T) {
 	t.Logf("records: active=%d free=%d carved=%d", active, free, carved)
 }
 
+// TestImageDirectoryIndexIsConsistent verifies every directory's hash index
+// against its data blocks.
+//
+// On an untampered filesystem the kernel maintains both together, so any
+// divergence here is a genuine finding. Directories with no index (short-form
+// and single-block) are reported as such and are consistent by definition.
+func TestImageDirectoryIndexIsConsistent(t *testing.T) {
+	volume := openConformanceImage(t)
+
+	indexed, unindexed := 0, 0
+	for _, directory := range walkImageDirectories(t, volume) {
+		report, err := volume.VerifyDirectoryIndex(directory.inode)
+		if err != nil {
+			t.Errorf("%s: VerifyDirectoryIndex failed: %v", directory.path, err)
+			continue
+		}
+		if !report.HasIndex {
+			unindexed++
+			continue
+		}
+		indexed++
+		if !report.Consistent() {
+			t.Errorf("%s: hash index diverges from data blocks: missing=%v mismatched=%v dangling=%d",
+				directory.path, report.MissingFromIndex, report.HashMismatches, report.DanglingIndexEntries)
+		}
+	}
+	t.Logf("directories with a hash index: %d, without: %d", indexed, unindexed)
+}
+
+// TestImageHashLookupAgreesWithWalk checks that resolving a name through the
+// hash index gives the same answer as a linear walk, for every entry.
+func TestImageHashLookupAgreesWithWalk(t *testing.T) {
+	volume := openConformanceImage(t)
+
+	checked := 0
+	for _, directory := range walkImageDirectories(t, volume) {
+		inode, err := volume.OpenInode(directory.inode)
+		if err != nil {
+			continue
+		}
+		entries, err := volume.ListDirectoryEntries(directory.inode)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			found, ok := volume.lookupDirectoryEntryByHash(inode, entry.Name)
+			if !ok {
+				// No index, or the name is not indexed: the walk is the
+				// authority and the caller falls back to it.
+				continue
+			}
+			checked++
+			if found.InodeNumber != entry.InodeNumber {
+				t.Errorf("%s/%s: hash lookup returned inode %d, walk returned %d",
+					directory.path, entry.Name, found.InodeNumber, entry.InodeNumber)
+			}
+		}
+	}
+	t.Logf("cross-checked %d hash lookups against the walk", checked)
+}
+
 // TestImageReportGeneration exercises the report surface end to end.
 func TestImageReportGeneration(t *testing.T) {
 	volume := openConformanceImage(t)
