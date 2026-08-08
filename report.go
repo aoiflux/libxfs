@@ -82,7 +82,13 @@ type InodeFragment struct {
 	LogicalBlockNumber  uint64 `json:"logical_block_number"`
 	PhysicalBlockNumber uint64 `json:"physical_block_number"`
 	NumberOfBlocks      uint32 `json:"number_of_blocks"`
-	IsSparse            bool   `json:"is_sparse"`
+	// IsSparse marks a fragment that reads back as zeros, whether because it
+	// is an unmapped hole or because it was preallocated and never written.
+	IsSparse bool `json:"is_sparse"`
+	// IsUnwritten distinguishes the second case: blocks were reserved on disk
+	// and never written to. Unlike a hole, PhysicalBlockNumber names real
+	// blocks whose prior contents may still be recoverable from the medium.
+	IsUnwritten bool `json:"is_unwritten"`
 }
 
 // InodeForensicReport is structured metadata for one inode.
@@ -290,10 +296,21 @@ func (v *Volume) inodeForensicReportWithMode(inodeNumber uint64, mode Verificati
 			PhysicalBlockNumber: extent.PhysicalBlockNumber,
 			NumberOfBlocks:      extent.NumberOfBlocks,
 			IsSparse:            isSparse,
+			IsUnwritten:         (extent.RangeFlags & ExtentFlagUnwritten) != 0,
 		}
-		if !isSparse && extent.NumberOfBlocks > 0 {
-			fragment.StartOffset = extent.PhysicalBlockNumber * uint64(v.ioh.blockSize)
-			fragment.EndOffset = fragment.StartOffset + lengthBytes
+		// StartOffset is a byte offset into the volume, so the allocation
+		// group packed into the block number has to be resolved first.
+		// Scaling the raw block number by the block size names a location
+		// that is not where the data lives.
+		//
+		// An unwritten fragment gets an offset even though it reads as zeros:
+		// it occupies real blocks, and where they are is exactly what makes it
+		// worth examining. A hole has no location to report.
+		if (!isSparse || fragment.IsUnwritten) && extent.NumberOfBlocks > 0 {
+			if start, err := v.fileSystemBlockOffset(extent.PhysicalBlockNumber); err == nil {
+				fragment.StartOffset = uint64(start)
+				fragment.EndOffset = fragment.StartOffset + lengthBytes
+			}
 		}
 		report.Fragments = append(report.Fragments, fragment)
 	}

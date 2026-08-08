@@ -1,0 +1,43 @@
+{
+  "case": "v4noftype",
+  "generator": "mkfs.xfs version 6.6.0",
+  "oracle_used": "xfs_db only (image is not mountable on this kernel)",
+  "block_size": 4096,
+  "directory_block_size": 4096,
+  "root_inode": 128,
+  "total_paths": 3407,
+  "total_directories": 5,
+  "path_set_sha256": "e11465a377a2fb821759aeaffabd04b6da9847461632c7db49fd1a8fe58ae5f3",
+  "directories": [
+    {
+      "path": "/",
+      "inode": 128,
+      "source_format": "short_form",
+      "entries": 3
+    },
+    {
+      "path": "/leafdir",
+      "inode": 1572992,
+      "source_format": "leaf",
+      "entries": 400
+    },
+    {
+      "path": "/nodedir",
+      "inode": 131,
+      "source_format": "node",
+      "entries": 3000
+    },
+    {
+      "path": "/sfdir",
+      "inode": 524416,
+      "source_format": "short_form",
+      "entries": 2
+    },
+    {
+      "path": "/sfdir/child",
+      "inode": 1310848,
+      "source_format": "short_form",
+      "entries": 1
+    }
+  ]
+}

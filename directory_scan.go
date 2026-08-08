@@ -35,6 +35,13 @@ type DirectoryScanOptions struct {
 	// MaxEntries caps the number of records collected. Zero applies the
 	// default cap.
 	MaxEntries int
+
+	// includeDotEntries keeps the "." and ".." records, which every other
+	// caller wants filtered out. Only index verification needs them, because
+	// XFS indexes them alongside every other name, and a comparison that
+	// dropped them from one side would report every intact directory as
+	// divergent.
+	includeDotEntries bool
 }
 
 func (o DirectoryScanOptions) maxBlocks() uint64 {
@@ -67,8 +74,18 @@ type DirectoryListing struct {
 	Truncated bool `json:"truncated,omitempty"`
 	// BlocksScanned counts directory blocks actually read.
 	BlocksScanned uint64 `json:"blocks_scanned,omitempty"`
-	// Format names the directory layout that was parsed.
+	// Format names the directory layout that was parsed. It distinguishes only
+	// what the walker had to do: a single block, or several. Use SourceFormat
+	// to learn the directory's actual on-disk shape.
 	Format string `json:"format,omitempty"`
+	// SourceFormat names the directory's on-disk index format: short_form,
+	// block, leaf or node.
+	//
+	// It is derived from the inode's fork type and from where the directory's
+	// blocks sit in its logical space, not from how many data blocks it has.
+	// Two directories with the same data-block count can be in different
+	// formats, so Format cannot answer this and must not be used to.
+	SourceFormat string `json:"source_format,omitempty"`
 }
 
 // Directory layout names reported in DirectoryListing.Format.
@@ -77,6 +94,57 @@ const (
 	DirectoryFormatBlock      = "block"
 	DirectoryFormatMultiBlock = "multi_block"
 )
+
+// On-disk directory index formats reported in DirectoryListing.SourceFormat.
+const (
+	DirectorySourceFormatShortForm = "short_form"
+	DirectorySourceFormatBlock     = "block"
+	DirectorySourceFormatLeaf      = "leaf"
+	DirectorySourceFormatNode      = "node"
+)
+
+// directorySourceFormat determines a directory's on-disk index format.
+//
+// XFS divides a directory's logical space into 32 GiB regions: data blocks in
+// the first, the leaf and node index in the second, free-space bitmaps in the
+// third. A directory with nothing in the index region is in block format; one
+// whose index is a single directory block is in leaf format; anything larger
+// needs a da-node above the leaves.
+func (v *Volume) directorySourceFormat(inode *Inode) string {
+	if inode.ForkType == ForkTypeInlineData {
+		return DirectorySourceFormatShortForm
+	}
+	blockSize := uint64(v.ioh.blockSize)
+	directoryBlockSize := uint64(v.directoryBlockSize())
+	if blockSize == 0 || directoryBlockSize == 0 {
+		return ""
+	}
+
+	leafRegionStart := dirLeafSpaceOffset / blockSize
+	freeRegionStart := dirFreeSpaceOffset / blockSize
+
+	var leafBlocks, freeBlocks uint64
+	for _, extent := range inode.DataExtents {
+		if extent.RangeFlags&ExtentFlagSparse != 0 {
+			continue
+		}
+		switch {
+		case extent.LogicalBlockNumber >= freeRegionStart:
+			freeBlocks += uint64(extent.NumberOfBlocks)
+		case extent.LogicalBlockNumber >= leafRegionStart:
+			leafBlocks += uint64(extent.NumberOfBlocks)
+		}
+	}
+
+	switch {
+	case leafBlocks == 0 && freeBlocks == 0:
+		return DirectorySourceFormatBlock
+	case freeBlocks == 0 && leafBlocks*blockSize <= directoryBlockSize:
+		return DirectorySourceFormatLeaf
+	default:
+		return DirectorySourceFormatNode
+	}
+}
 
 // ListDirectoryEntriesWithOptions lists a directory under explicit scan options.
 func (v *Volume) ListDirectoryEntriesWithOptions(inodeNumber uint64, options DirectoryScanOptions) (DirectoryListing, error) {
@@ -228,6 +296,8 @@ func (v *Volume) scanDirectory(inodeNumber uint64, options DirectoryScanOptions)
 		return listing, wrapParseError(0, "directory_inode", ErrInvalidInode)
 	}
 
+	listing.SourceFormat = v.directorySourceFormat(inode)
+
 	entries, err := parseShortFormDirectoryEntries(inode, v.ioh.formatVersion, v.ioh.secondaryFeatureFlags)
 	if err == nil {
 		listing.Format = DirectoryFormatShortForm
@@ -325,6 +395,20 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 	maxEntries := options.maxEntries()
 	collected := 0
 
+	// firstError holds the first failure met while walking the blocks.
+	//
+	// A directory is a sequence of independently framed blocks, so damage to
+	// one says nothing about the others. Returning at the first failure throws
+	// away every entry in every later block, which on a recursive walk silently
+	// discards the whole subtree. Instead every block is attempted, and the
+	// original error is returned at the end alongside everything recovered.
+	var firstError error
+	recordError := func(err error) {
+		if firstError == nil {
+			firstError = err
+		}
+	}
+
 	buffer := make([]byte, directoryBlockSize)
 
 	for blockIndex := uint64(0); blockIndex < blockCount; blockIndex++ {
@@ -337,19 +421,19 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 
 		n, readErr := v.readInodeData(inode, buffer[:readSize], int64(blockOffset))
 		if readErr != nil && readErr != io.EOF {
-			if !options.BestEffort {
-				return listing, readErr
-			}
+			recordError(readErr)
 			listing.Anomalies = append(listing.Anomalies, ReportAnomaly{
 				Code:     "directory_block_read_failed",
 				Severity: "error",
 				Inode:    listing.InodeNumber,
 				Message:  fmt.Sprintf("directory block %d: %v", blockIndex, readErr),
 			})
-			break
+			// An unreadable block is a hole in the evidence, not the end of it.
+			// Later blocks are mapped independently and are usually readable.
+			continue
 		}
 		if n == 0 {
-			break
+			continue
 		}
 		listing.BlocksScanned++
 
@@ -369,10 +453,10 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 				Message: fmt.Sprintf("directory block %d holds a %s block inside the data space",
 					blockIndex, kind),
 			}
-			if !options.BestEffort {
-				return listing, fmt.Errorf("%w: %s", ErrUnsupportedDirFormat, anomaly.Message)
-			}
 			listing.Anomalies = append(listing.Anomalies, anomaly)
+			if !options.BestEffort {
+				recordError(fmt.Errorf("%w: %s", ErrUnsupportedDirFormat, anomaly.Message))
+			}
 			continue
 		}
 
@@ -380,6 +464,7 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 			hasFileType:          directoryHasFileType(v.ioh.formatVersion, v.ioh.secondaryFeatureFlags),
 			includeDeleted:       options.IncludeDeleted,
 			bestEffort:           options.BestEffort,
+			includeDotEntries:    options.includeDotEntries,
 			explainActiveRecords: options.IncludeDeleted,
 			blockIndex:           blockIndex,
 			blockOffset:          blockOffset,
@@ -389,9 +474,7 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 		}
 		listing.Anomalies = append(listing.Anomalies, anomalies...)
 		if err != nil {
-			if !options.BestEffort {
-				return listing, err
-			}
+			recordError(err)
 			listing.Anomalies = append(listing.Anomalies, ReportAnomaly{
 				Code:     "directory_block_parse_failed",
 				Severity: "error",
@@ -404,7 +487,7 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 		for _, record := range records {
 			if collected >= maxEntries {
 				listing.Truncated = true
-				return listing, nil
+				return listing, scanError(listing, options, firstError)
 			}
 			collected++
 
@@ -426,5 +509,25 @@ func (v *Volume) scanBlockDirectory(inode *Inode, listing DirectoryListing, opti
 		}
 	}
 
-	return listing, nil
+	return listing, scanError(listing, options, firstError)
+}
+
+// scanError reports the outcome of a completed block walk.
+//
+// A real failure is reported as itself, so that callers matching on
+// ErrInvalidInode or ErrUnsupportedDirFormat keep working.
+//
+// Truncation is an error only when the cap that fired was the package default.
+// A caller that set MaxBlocks or MaxEntries asked to be cut off and reads
+// Truncated to find out; a caller that set neither does not know a cap exists,
+// and would otherwise present a partial directory as the whole thing.
+func scanError(listing DirectoryListing, options DirectoryScanOptions, firstError error) error {
+	if firstError != nil {
+		return firstError
+	}
+	if listing.Truncated && options.MaxBlocks == 0 && options.MaxEntries == 0 {
+		return fmt.Errorf("%w: inode %d stopped after %d blocks and %d entries at the default limit",
+			ErrDirectoryTruncated, listing.InodeNumber, listing.BlocksScanned, len(listing.Entries))
+	}
+	return nil
 }

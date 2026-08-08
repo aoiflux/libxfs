@@ -1,0 +1,26 @@
+{
+  "case": "block",
+  "generator": "mkfs.xfs version 6.6.0",
+  "oracle_used": "kernel mount and xfs_db",
+  "block_size": 4096,
+  "directory_block_size": 4096,
+  "root_inode": 128,
+  "total_paths": 43,
+  "total_directories": 2,
+  "path_set_sha256": "bcc9ee2f9c145220b02ef8780b818f395829ce1bde0e15b6303134c5d1c7ac3b",
+  "attribute_set_sha256": "aa5f78b469875b185a28a9b2bfbc895576c766febc3ade0c8883f43a7b489ba0",
+  "directories": [
+    {
+      "path": "/",
+      "inode": 128,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/blockdir",
+      "inode": 131,
+      "source_format": "block",
+      "entries": 41
+    }
+  ]
+}

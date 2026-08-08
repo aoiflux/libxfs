@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"sync"
 )
 
@@ -321,8 +322,14 @@ func (v *Volume) readFromExtents(extents []Extent, totalSize uint64, p []byte, o
 			continue
 		}
 
+		// An XFS extent never spans an allocation group, so advancing the
+		// group-relative part of the block number stays inside the group.
 		physicalBlock := extent.PhysicalBlockNumber + extentBlockIndex
-		diskOff := int64(physicalBlock*uint64(v.ioh.blockSize) + inBlockOffset)
+		blockOffset, err := v.fileSystemBlockOffset(physicalBlock)
+		if err != nil {
+			return written, err
+		}
+		diskOff := blockOffset + int64(inBlockOffset)
 		if err := v.readAt(p[written:written+int(toRead)], diskOff); err != nil {
 			return written, wrapIOError("read", diskOff, int(toRead), err)
 		}
@@ -335,20 +342,71 @@ func (v *Volume) readFromExtents(extents []Extent, totalSize uint64, p []byte, o
 	return written, nil
 }
 
+// fileSystemBlockOffset converts an XFS filesystem block number to a byte
+// offset within the volume.
+//
+// An fsblock is not a linear block index. It packs the allocation group number
+// into the high bits and the group-relative block number into the low
+// sb_agblklog bits. The stride between groups on disk is sb_agblocks, which
+// equals 1<<sb_agblklog only when the group size happens to be a power of two,
+// so reading an fsblock as though it were linear addresses the wrong data for
+// every group above the first, and runs off the end of the volume near the
+// last one. Group zero is the only one where the two happen to coincide, which
+// is why this is invisible on small single-group images.
+func (v *Volume) fileSystemBlockOffset(fileSystemBlock uint64) (int64, error) {
+	if v.ioh.blockSize == 0 {
+		return 0, wrapParseError(0, "block_size", ErrInvalidSuperblock)
+	}
+	bits := v.ioh.relativeBlockNumberBits
+	if v.ioh.allocationGroupSize == 0 || bits == 0 || bits >= 64 {
+		return 0, wrapParseError(int64(bits), "allocation_group_geometry", ErrInvalidSuperblock)
+	}
+
+	allocationGroupIndex := fileSystemBlock >> bits
+	relativeBlockNumber := fileSystemBlock & ((uint64(1) << bits) - 1)
+
+	linearBlock := allocationGroupIndex*uint64(v.ioh.allocationGroupSize) + relativeBlockNumber
+	if linearBlock > uint64(math.MaxInt64)/uint64(v.ioh.blockSize) {
+		return 0, wrapParseError(int64(fileSystemBlock), "file_system_block", ErrInvalidInode)
+	}
+
+	// The resolved block is bounded against the volume rather than against
+	// sb_agblocks. Both sb_agblocks and sb_agblklog are attacker controlled on
+	// a crafted image, so treating their disagreement as fatal would reject
+	// recoverable data without preventing any access the volume bound does not
+	// already prevent.
+	if v.sb != nil && v.sb.NumberOfBlocks != 0 && linearBlock >= v.sb.NumberOfBlocks {
+		return 0, wrapParseError(int64(fileSystemBlock), "file_system_block", ErrInvalidInode)
+	}
+	return int64(linearBlock * uint64(v.ioh.blockSize)), nil
+}
+
+// findExtentForBlock locates the extent covering a logical block, and when
+// there is none, the start of the next mapped extent so the caller can size
+// the hole.
+//
+// extents must be sorted by logical block, which is how they are stored on
+// disk and how normalizeExtents leaves them. The search is binary
+// because it runs once per read chunk: scanning linearly made reading a file
+// with many extents quadratic in the extent count.
 func findExtentForBlock(extents []Extent, logicalBlock uint64) (*Extent, uint64) {
-	var nextLogical uint64 = math.MaxUint64
-	for i := range extents {
-		extent := &extents[i]
-		start := extent.LogicalBlockNumber
-		end := start + uint64(extent.NumberOfBlocks)
-		if logicalBlock >= start && logicalBlock < end {
-			return extent, nextLogical
-		}
-		if start > logicalBlock && start < nextLogical {
-			nextLogical = start
+	// First extent starting strictly after logicalBlock.
+	next := sort.Search(len(extents), func(i int) bool {
+		return extents[i].LogicalBlockNumber > logicalBlock
+	})
+
+	// Only the extent immediately before it can contain the block.
+	if next > 0 {
+		candidate := &extents[next-1]
+		end := candidate.LogicalBlockNumber + uint64(candidate.NumberOfBlocks)
+		if logicalBlock >= candidate.LogicalBlockNumber && logicalBlock < end {
+			return candidate, math.MaxUint64
 		}
 	}
-	return nil, nextLogical
+	if next < len(extents) {
+		return nil, extents[next].LogicalBlockNumber
+	}
+	return nil, math.MaxUint64
 }
 
 func (v *Volume) populateExtentBtreeExtents(inode *Inode) error {
@@ -409,10 +467,11 @@ func (v *Volume) populateAttributesFork(inode *Inode) error {
 		if inode.AttributeExtentCount == 0 {
 			return nil
 		}
-		extents, err := parseExtentList(numberOfBlocks, inode.AttributeExtentCount, data, false)
+		extents, err := parseExtentList(inode.AttributeExtentCount, data)
 		if err != nil {
 			return err
 		}
+		extents = normalizeExtents(extents)
 		inode.AttributesExtents = extents
 	case ForkTypeBtree:
 		extents, err := v.parseExtentsFromBtreeRoot(data, numberOfBlocks, false)
@@ -441,32 +500,21 @@ func (v *Volume) parseExtentsFromBtreeRoot(data []byte, numberOfBlocks uint64, a
 		return nil, wrapParseError(0, "extent_btree_level", ErrInvalidInode)
 	}
 
-	extents, err := v.getExtentsFromExtentBtreeBranchNode(numberOfRecords, data[4:], addSparseExtents, int(level), 0)
+	extents, err := v.getExtentsFromExtentBtreeBranchNode(numberOfRecords, data[4:], int(level), 0)
 	if err != nil {
 		return nil, err
 	}
 
+	// The whole fork is in hand only here, which is the only place holes can
+	// be located correctly.
+	extents = normalizeExtents(extents)
 	if addSparseExtents {
-		logicalBlockNumber := uint64(0)
-		if len(extents) > 0 {
-			last := extents[len(extents)-1]
-			logicalBlockNumber = last.LogicalBlockNumber + uint64(last.NumberOfBlocks)
-		}
-		if logicalBlockNumber < numberOfBlocks {
-			if len(extents) == 0 || (extents[len(extents)-1].RangeFlags&ExtentFlagSparse) == 0 {
-				extents = append(extents, Extent{
-					LogicalBlockNumber: logicalBlockNumber,
-					RangeFlags:         ExtentFlagSparse,
-				})
-			}
-			extents[len(extents)-1].NumberOfBlocks += uint32(numberOfBlocks - logicalBlockNumber)
-		}
+		extents = fillSparseExtents(extents, numberOfBlocks)
 	}
-
 	return extents, nil
 }
 
-func (v *Volume) getExtentsFromExtentBtreeBranchNode(numberOfRecords uint16, recordsData []byte, addSparseExtents bool, maximumDepth int, recursionDepth int) ([]Extent, error) {
+func (v *Volume) getExtentsFromExtentBtreeBranchNode(numberOfRecords uint16, recordsData []byte, maximumDepth int, recursionDepth int) ([]Extent, error) {
 	if recursionDepth < 0 || recursionDepth > maxBtreeRecursionDepth {
 		return nil, wrapParseError(0, "extent_btree_recursion_depth", ErrInvalidInode)
 	}
@@ -485,7 +533,7 @@ func (v *Volume) getExtentsFromExtentBtreeBranchNode(numberOfRecords uint16, rec
 			return nil, wrapParseError(int64(valuesOffset+i*8), "extent_btree_branch_value", ErrInvalidInode)
 		}
 
-		extents, err := v.getExtentsFromExtentBtreeNode(subBlock, addSparseExtents, maximumDepth, recursionDepth+1)
+		extents, err := v.getExtentsFromExtentBtreeNode(subBlock, maximumDepth, recursionDepth+1)
 		if err != nil {
 			return nil, err
 		}
@@ -495,7 +543,7 @@ func (v *Volume) getExtentsFromExtentBtreeBranchNode(numberOfRecords uint16, rec
 	return result, nil
 }
 
-func (v *Volume) getExtentsFromExtentBtreeNode(blockNumber uint64, addSparseExtents bool, maximumDepth int, recursionDepth int) ([]Extent, error) {
+func (v *Volume) getExtentsFromExtentBtreeNode(blockNumber uint64, maximumDepth int, recursionDepth int) ([]Extent, error) {
 	if v.ioh.allocationGroupSize == 0 {
 		return nil, wrapParseError(0, "allocation_group_size", ErrInvalidSuperblock)
 	}
@@ -506,14 +554,10 @@ func (v *Volume) getExtentsFromExtentBtreeNode(blockNumber uint64, addSparseExte
 		return nil, wrapParseError(0, "extent_btree_recursion_depth", ErrInvalidInode)
 	}
 
-	allocationGroupIndex := blockNumber >> v.ioh.relativeBlockNumberBits
-	relativeBlockNumber := blockNumber & ((uint64(1) << v.ioh.relativeBlockNumberBits) - 1)
-
-	offsetBlocks := allocationGroupIndex*uint64(v.ioh.allocationGroupSize) + relativeBlockNumber
-	if offsetBlocks > uint64(math.MaxInt64)/uint64(v.ioh.blockSize) {
-		return nil, wrapParseError(0, "extent_btree_block_number", ErrInvalidInode)
+	offset, err := v.fileSystemBlockOffset(blockNumber)
+	if err != nil {
+		return nil, err
 	}
-	offset := int64(offsetBlocks * uint64(v.ioh.blockSize))
 
 	blockData := make([]byte, v.ioh.blockSize)
 	if err := v.readAt(blockData, offset); err != nil {
@@ -541,10 +585,10 @@ func (v *Volume) getExtentsFromExtentBtreeNode(blockNumber uint64, addSparseExte
 	}
 
 	if header.Level == 0 {
-		return parseExtentList(0, uint32(header.NumberOfRecords), recordsData, addSparseExtents)
+		return parseExtentList(uint32(header.NumberOfRecords), recordsData)
 	}
 
-	return v.getExtentsFromExtentBtreeBranchNode(header.NumberOfRecords, recordsData, addSparseExtents, maximumDepth, recursionDepth)
+	return v.getExtentsFromExtentBtreeBranchNode(header.NumberOfRecords, recordsData, maximumDepth, recursionDepth)
 }
 
 func (v *Volume) hasRelativeInodeInBtree(allocationGroupIndex int, relativeInodeNumber uint64) (bool, error) {
@@ -1094,9 +1138,13 @@ func parseInode(data []byte, blockSize uint32, features inodeFeatures) (*Inode, 
 			return inode, nil
 		}
 
-		extents, err := parseExtentList(numberOfBlocks, numberOfExtents, data[start:end], addSparseExtents)
+		extents, err := parseExtentList(numberOfExtents, data[start:end])
 		if err != nil {
 			return nil, err
+		}
+		extents = normalizeExtents(extents)
+		if addSparseExtents {
+			extents = fillSparseExtents(extents, numberOfBlocks)
 		}
 		inode.DataExtents = extents
 	}

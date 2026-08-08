@@ -1,0 +1,26 @@
+{
+  "case": "leaf",
+  "generator": "mkfs.xfs version 6.6.0",
+  "oracle_used": "kernel mount and xfs_db",
+  "block_size": 4096,
+  "directory_block_size": 4096,
+  "root_inode": 128,
+  "total_paths": 402,
+  "total_directories": 2,
+  "path_set_sha256": "a7a55a471c2666171abe1405993c5263b2b5e3999f7cec812e9d8fe18a1b8369",
+  "attribute_set_sha256": "593743d00b8626672c1f8719d47e66507d35f9f7c6d44d881f93c34b29c363f1",
+  "directories": [
+    {
+      "path": "/",
+      "inode": 128,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/leafdir",
+      "inode": 131,
+      "source_format": "leaf",
+      "entries": 400
+    }
+  ]
+}

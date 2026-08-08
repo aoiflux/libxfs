@@ -200,11 +200,50 @@ or inconsistent; an index never reduces what can be recovered.
 
 ### Damaged directories
 
-The zero-value options are strict: any framing error aborts the scan. Set
-`BestEffort` to keep what was recovered from healthy blocks, resynchronise past
-damage, and collect `ReportAnomaly` entries describing what went wrong.
-`MaxBlocks` and `MaxEntries` bound the work; when a cap is reached the listing
-reports `Truncated` rather than silently looking complete.
+A directory is a sequence of independently framed blocks, so damage to one says
+nothing about the others. An unreadable or unrecognisable block costs only
+itself: the scan records an anomaly, continues through the remaining blocks, and
+returns everything it recovered **alongside** the error. Discarding the rest
+would silently remove the whole subtree beneath that directory from a recursive
+walk.
+
+`BestEffort` additionally resynchronises *within* a damaged block, recovering
+entries either side of the damage instead of stopping at the first bad framing.
+
+Because entries are returned with the error, check both:
+
+```go
+listing, err := vol.ListDirectoryEntriesReport(ino)
+// listing.Entries is usable even when err != nil.
+if errors.Is(err, libxfs.ErrDirectoryTruncated) {
+    // A safety cap was reached; the listing is a prefix, not the directory.
+}
+for _, a := range listing.Anomalies { /* what was skipped, and why */ }
+```
+
+`ListDirectoryEntries` returns only the entries, so it cannot distinguish a
+complete listing from a partial one — use `ListDirectoryEntriesReport` when
+completeness matters. `MaxBlocks` and `MaxEntries` bound the work and set
+`Truncated`; when the *default* caps are what stopped the scan the error is
+`ErrDirectoryTruncated`, since a caller who did not ask for a cap has no other
+way to know one exists.
+
+### Deleted entry recovery
+
+Carved candidates come from entry bytes that survive inside reclaimed space.
+What survives is decided by XFS, not by this library: freeing an entry writes a
+free-run header over the first four bytes of the record, destroying that entry's
+inode number, while entries behind it in a coalesced run keep their bytes
+intact.
+
+So recall is a property of the image, not a guarantee. On the regression corpus,
+deleting two contiguous runs of 40 entries recovers 78 of the 80 names — each
+run loses exactly the record whose header was overwritten. Isolated single
+deletions typically recover nothing, and this is expected rather than a defect.
+
+Soundness is the part that is guaranteed and tested: a deleted name is never
+reported as a live entry, a live entry is never missing, and a carved record is
+never presented as fact.
 
 ## Filesystem Features
 
@@ -300,6 +339,66 @@ LIBXFS_TEST_IMAGE=/path/to/xfs.dd go test ./...
 Synthetic fixtures only prove the parser agrees with its author's reading of the
 format. Testing against an image from `mkfs.xfs` is what catches a
 misunderstanding shared by both the parser and its fixtures.
+
+### Walk completeness
+
+A directory walk that returns plausible results is not the same as one that
+returns every entry. Establishing completeness needs an oracle that shares no
+code with this library, so `tools/corpus/` builds one.
+
+`tools/corpus/mkcorpus.sh` creates a corpus of real images spanning every
+directory format — short-form, block, leaf and node, each with both
+extent-mapped and b+tree-mapped data forks — plus punched holes, sparse and
+preallocated files, hardlinks, device nodes, 255-byte and non-ASCII names,
+1 KiB/4 KiB/16 KiB geometries, v4 and v4-without-ftype images, one image with a
+directory block deliberately destroyed, and one with a recorded set of entries
+deleted from a live directory.
+
+`tools/corpus/mkoracle.sh` describes each image twice: once through a read-only
+kernel mount, and once through `xfs_db`, which needs neither a mount nor kernel
+XFS support. The two are checked against each other before either is used to
+judge libxfs. The second oracle is what covers v4 images, which kernels built
+without `CONFIG_XFS_SUPPORT_V4` refuse to mount at all.
+
+Building the corpus needs Linux, root and `xfsprogs`:
+
+```bash
+sudo apt install xfsprogs attr
+sudo tools/corpus/mkcorpus.sh
+sudo tools/corpus/mkoracle.sh
+tools/corpus/runtests.sh
+```
+
+The tests compare the walk against the oracle path by path and directory by
+directory, attribute any shortfall to the on-disk format of the directory that
+should have produced it, verify each directory's hash index against its own data
+blocks, and check every file's contents against the kernel's digest.
+
+### Committed fixtures
+
+The corpus itself is not committed, but its conclusions are. `testdata/corpus/`
+holds a manifest per case recording what the oracle determined that image
+contains: total paths, per-directory entry counts, on-disk formats, and digests
+over the exact set of paths, inode numbers, kinds and sizes. They are small,
+reviewable text, so a change to one is a visible change in what the library is
+expected to find.
+
+The images those manifests describe are **not** committed — each is a megabyte
+or more of binary. Rebuild them from the corpus with:
+
+```bash
+sudo tools/corpus/mkfixtures.sh
+```
+
+This writes a metadata-only copy of each image, produced with `xfs_metadump`,
+next to its manifest. Once built, `go test ./...` checks them on any platform
+with no corpus, no root and no `xfsprogs`. Cases whose image has not been built
+are skipped, so the suite passes on a fresh checkout.
+
+The fixtures assert structure — paths, inode numbers, kinds, sizes,
+per-directory counts and on-disk formats — and never file contents, because
+`xfs_metadump` zeroes file data by design. Contents are checked against the
+kernel by the corpus tests.
 
 ## Project Status
 

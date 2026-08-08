@@ -73,6 +73,48 @@ jobs:
       - name: Test with race detector
         run: go test -race ./...
 
+  corpus:
+    name: walk completeness against mkfs.xfs
+    runs-on: ubuntu-latest
+    # Building the corpus creates tens of thousands of files across fifteen
+    # filesystems, which is slower than the rest of the suite put together.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          check-latest: true
+      - name: Install xfsprogs
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xfsprogs attr
+      - name: Report kernel XFS support
+        # v4 images cannot be mounted on a kernel built without
+        # CONFIG_XFS_SUPPORT_V4. The tests fall back to the xfs_db oracle
+        # there, so this is recorded rather than required.
+        run: |
+          grep -q xfs /proc/filesystems || { echo "kernel has no XFS support"; exit 1; }
+          zcat /proc/config.gz 2>/dev/null | grep -i XFS_SUPPORT_V4 || echo "V4 support unknown"
+      - name: Build the corpus
+        run: sudo tools/corpus/mkcorpus.sh
+      - name: Describe it with both oracles
+        run: sudo tools/corpus/mkoracle.sh
+      - name: Diff the walk against ground truth
+        run: tools/corpus/runtests.sh
+      # The fixture manifests are committed but the images they describe are
+      # not, so this job rebuilds the images and checks the committed
+      # expectations against them. Doing it in the same job that just built the
+      # corpus from scratch is what stops those expectations from drifting away
+      # from what mkfs.xfs actually produces.
+      - name: Rebuild the fixture images
+        run: sudo tools/corpus/mkfixtures.sh
+      - name: Check the committed manifests still hold
+        run: go test -count=1 -run TestCommittedCorpusFixtures -v .
+      # mkfixtures.sh rewrites the manifests from the oracle. If that changed
+      # any of them, the committed expectations no longer match reality and the
+      # difference needs to be reviewed rather than silently accepted.
+      - name: Report any manifest drift
+        run: git diff --stat -- testdata/corpus || true
+
   fuzz:
     name: fuzz smoke
     runs-on: ubuntu-latest

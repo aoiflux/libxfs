@@ -348,12 +348,17 @@ func (f *fixtureImage) buildDirectoryLeafBlock(entries []fixtureLeafEntry, leafN
 	block := make([]byte, f.dirBlockSize)
 
 	headerSize := 16
+	// count and stale follow the block info header. On v5 the header ends with
+	// four bytes of padding after them, so they cannot be placed by counting
+	// back from the end of the header.
+	countOffset := 12
 	magic := uint16(0xd2f1) // XFS_DIR2_LEAF1_MAGIC
 	if leafN {
 		magic = 0xd2ff // XFS_DIR2_LEAFN_MAGIC
 	}
 	if f.formatVersion == 5 {
 		headerSize = 64
+		countOffset = 56
 		magic = 0x3df1 // XFS_DIR3_LEAF1_MAGIC
 		if leafN {
 			magic = 0x3dff // XFS_DIR3_LEAFN_MAGIC
@@ -361,8 +366,8 @@ func (f *fixtureImage) buildDirectoryLeafBlock(entries []fixtureLeafEntry, leafN
 	}
 
 	binary.BigEndian.PutUint16(block[8:10], magic)
-	binary.BigEndian.PutUint16(block[headerSize-4:headerSize-2], uint16(len(entries)))
-	binary.BigEndian.PutUint16(block[headerSize-2:headerSize], 0) // stale
+	binary.BigEndian.PutUint16(block[countOffset:countOffset+2], uint16(len(entries)))
+	binary.BigEndian.PutUint16(block[countOffset+2:countOffset+4], 0) // stale
 
 	for i, entry := range entries {
 		offset := headerSize + i*8

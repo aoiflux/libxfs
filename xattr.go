@@ -131,19 +131,12 @@ func (v *Volume) readAttributesLogicalBlock(inode *Inode, blockNumber uint32) ([
 		return nil, wrapParseError(0, "xattr_block_number", ErrInvalidAttributeData)
 	}
 
-	if v.ioh.blockSize == 0 || v.ioh.allocationGroupSize == 0 {
-		return nil, wrapParseError(0, "io_geometry", ErrInvalidSuperblock)
+	physicalBlock := extent.PhysicalBlockNumber + (uint64(blockNumber) - extent.LogicalBlockNumber)
+	offset, err := v.fileSystemBlockOffset(physicalBlock)
+	if err != nil {
+		return nil, err
 	}
 
-	allocationGroupIndex := extent.PhysicalBlockNumber >> v.ioh.relativeBlockNumberBits
-	relativeBlockNumber := extent.PhysicalBlockNumber & ((uint64(1) << v.ioh.relativeBlockNumberBits) - 1)
-
-	offBlocks := allocationGroupIndex*uint64(v.ioh.allocationGroupSize) + relativeBlockNumber + (uint64(blockNumber) - extent.LogicalBlockNumber)
-	if offBlocks > uint64(^uint(0)>>1)/uint64(v.ioh.blockSize) {
-		return nil, wrapParseError(0, "xattr_block_offset", ErrInvalidAttributeData)
-	}
-
-	offset := int64(offBlocks * uint64(v.ioh.blockSize))
 	buf := make([]byte, v.ioh.blockSize)
 	if err := v.readAt(buf, offset); err != nil {
 		return nil, wrapIOError("read", offset, len(buf), err)

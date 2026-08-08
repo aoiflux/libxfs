@@ -1,0 +1,36 @@
+# Corpus fixture images.
+#
+# The manifests beside them are committed: they are small, reviewable text, and
+# a change to one is a visible change in what the library is expected to find.
+# The images they describe are not, because they are megabytes of binary each.
+#
+# Rebuild them from the corpus with:
+#
+#	sudo tools/corpus/mkcorpus.sh
+#	sudo tools/corpus/mkoracle.sh
+#	sudo tools/corpus/mkfixtures.sh
+#
+# TestCommittedCorpusFixtures skips any case whose image is absent, so the
+# suite passes without them and checks them wherever they have been built.
+testdata/corpus/*/image.img.gz
+
+# Filesystem images of any kind. This package's whole subject matter is disk
+# images, and they are large by nature; none of them belong in the repository.
+*.img
+*.img.gz
+*.metadump
+*.dd
+
+# Compiled binaries.
+*.exe
+*.test
+
+# Built example programs. A whitelist rather than a pattern for
+# extensionless binaries, which would also match the sources next to them.
+/examples/*/*
+!/examples/*/*.go
+!/examples/*/*.md
+
+# Go's fuzz cache. Failing inputs under testdata/fuzz are deliberately kept:
+# they are a few bytes each and are what stops a crash from coming back.
+/fuzz-cache/

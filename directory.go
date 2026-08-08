@@ -20,12 +20,32 @@ const maxPathTraversalDepth = 1024
 // Short-form, block, leaf, node and btree directories are all supported:
 // entries always live in the directory's data-block region, which is walked
 // one directory block at a time.
+// Entries recovered before a failure are returned alongside the error: on a
+// damaged image the blocks that did parse are evidence, and discarding them
+// because a later block did not is how a recursive walk loses whole subtrees.
+// Use ListDirectoryEntriesReport when the completeness of the listing matters.
 func (v *Volume) ListDirectoryEntries(inodeNumber uint64) ([]DirectoryEntry, error) {
 	listing, err := v.scanDirectory(inodeNumber, DirectoryScanOptions{})
+	return listing.Entries, err
+}
+
+// ListDirectoryEntriesReport lists a directory and reports how the scan went.
+//
+// ListDirectoryEntries returns only the entries, so a caller cannot tell a
+// complete listing from one that stopped at a cap or skipped an unreadable
+// block. The returned DirectoryListing carries Truncated, Anomalies,
+// BlocksScanned and SourceFormat for callers that must know.
+func (v *Volume) ListDirectoryEntriesReport(inodeNumber uint64) (DirectoryListing, error) {
+	return v.scanDirectory(inodeNumber, DirectoryScanOptions{})
+}
+
+// ListDirectoryEntriesReportByPath resolves a path and lists it with a report.
+func (v *Volume) ListDirectoryEntriesReportByPath(path string) (DirectoryListing, error) {
+	inodeNumber, err := v.ResolveInodeByPath(path)
 	if err != nil {
-		return nil, err
+		return DirectoryListing{}, err
 	}
-	return listing.Entries, nil
+	return v.ListDirectoryEntriesReport(inodeNumber)
 }
 
 // ListRootDirectoryEntries lists entries for the root directory inode.
@@ -228,14 +248,18 @@ func (v *Volume) lookupDirectoryEntry(directoryInode uint64, name string) (uint6
 		}
 	}
 
+	// The entries recovered before any failure are searched first. A directory
+	// with one unreadable block still resolves every name held in the blocks
+	// that were readable, and failing the whole lookup would strand the entire
+	// subtree below it.
 	entries, err := v.ListDirectoryEntries(directoryInode)
-	if err != nil {
-		return 0, err
-	}
 	for _, entry := range entries {
 		if entry.Name == name {
 			return entry.InodeNumber, nil
 		}
+	}
+	if err != nil {
+		return 0, err
 	}
 	return 0, nil
 }

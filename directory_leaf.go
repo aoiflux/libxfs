@@ -129,7 +129,10 @@ func (v *Volume) readDirectoryLogicalBlock(inode *Inode, logicalByteOffset uint6
 		extent, _ := findExtentForBlock(inode.DataExtents, logicalBlock)
 
 		physicalBlock := extent.PhysicalBlockNumber + (logicalBlock - extent.LogicalBlockNumber)
-		diskOffset := int64(physicalBlock * blockSize)
+		diskOffset, err := v.fileSystemBlockOffset(physicalBlock)
+		if err != nil {
+			return nil, err
+		}
 		if err := v.readAt(buffer[i*blockSize:(i+1)*blockSize], diskOffset); err != nil {
 			return nil, wrapIOError("read", diskOffset, int(blockSize), err)
 		}
@@ -144,12 +147,12 @@ func parseDirectoryLeafBlock(block []byte) ([]directoryLeafEntry, error) {
 		return nil, wrapParseError(daBlockInfoMagicOffset, "directory_leaf_magic", ErrInvalidInode)
 	}
 
-	headerSize := 0
+	headerSize, countOffset := 0, 0
 	switch magic {
 	case dirLeaf1MagicV4, dirLeafNMagicV4:
-		headerSize = dirLeafHeaderSizeV4
+		headerSize, countOffset = dirLeafHeaderSizeV4, daBlockInfoSizeV4
 	case dirLeaf1MagicV5, dirLeafNMagicV5:
-		headerSize = dirLeafHeaderSizeV5
+		headerSize, countOffset = dirLeafHeaderSizeV5, daBlockInfoSizeV5
 	default:
 		return nil, fmt.Errorf("%w: not a directory leaf block (magic 0x%04x)",
 			ErrUnsupportedDirFormat, magic)
@@ -158,10 +161,14 @@ func parseDirectoryLeafBlock(block []byte) ([]directoryLeafEntry, error) {
 		return nil, wrapParseError(0, "directory_leaf_header", ErrInvalidInode)
 	}
 
-	// count and stale sit immediately after the block info header.
-	count, ok := readUint16BE(block, headerSize-4)
+	// count and stale sit immediately after the block info header. They cannot
+	// be located by counting back from the end of the header: xfs_dir3_leaf_hdr
+	// ends in four bytes of padding that xfs_dir2_leaf_hdr does not have, so on
+	// a v5 filesystem the last four bytes are the pad, and reading the count
+	// from there yields zero for every directory in the filesystem.
+	count, ok := readUint16BE(block, countOffset)
 	if !ok {
-		return nil, wrapParseError(int64(headerSize-4), "directory_leaf_count", ErrInvalidInode)
+		return nil, wrapParseError(int64(countOffset), "directory_leaf_count", ErrInvalidInode)
 	}
 
 	available := (len(block) - headerSize) / dirLeafEntryPairSize
@@ -467,7 +474,14 @@ func (v *Volume) VerifyDirectoryIndex(inodeNumber uint64) (DirectoryIndexReport,
 		return report, wrapParseError(0, "directory_inode", ErrInvalidInode)
 	}
 
-	listing, err := v.ScanDirectoryRecordsWithOptions(inodeNumber, DirectoryScanOptions{BestEffort: true})
+	// The scan keeps "." and "..": XFS gives them leaf index entries like any
+	// other name, so leaving them out of the data side would make every intact
+	// directory report two dangling index entries.
+	listing, err := v.scanDirectory(inodeNumber, DirectoryScanOptions{
+		IncludeDeleted:    true,
+		BestEffort:        true,
+		includeDotEntries: true,
+	})
 	if err != nil {
 		return report, err
 	}
@@ -498,11 +512,18 @@ func (v *Volume) VerifyDirectoryIndex(inodeNumber uint64) (DirectoryIndexReport,
 		if record.Kind != RecordKindActive {
 			continue
 		}
-		report.DataEntries++
 
 		hash := xfsDirHashName([]byte(record.Name))
 		address := uint32(record.LogicalOffset / dirDataAlign)
 		seenAddresses[address] = true
+
+		// "." and ".." are indexed, so their addresses must be accounted for
+		// above, but they are not directory contents and DataEntries has
+		// always counted contents.
+		if record.Name == "." || record.Name == ".." {
+			continue
+		}
+		report.DataEntries++
 
 		addresses, ok := indexed[hash]
 		if !ok {

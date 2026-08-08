@@ -101,13 +101,50 @@ func FuzzParseExtentList(f *testing.F) {
 		if numberOfExtents > 4096 {
 			numberOfExtents = 4096
 		}
-		for _, addSparse := range []bool{true, false} {
-			extents, err := parseExtentList(numberOfBlocks, numberOfExtents, data, addSparse)
-			if err != nil {
-				continue
+		extents, err := parseExtentList(numberOfExtents, data)
+		if err != nil {
+			return
+		}
+		if len(extents) > 0 && numberOfExtents == 0 {
+			t.Fatalf("extents produced from a zero count: %d", len(extents))
+		}
+		if len(extents) != int(numberOfExtents) {
+			t.Fatalf("parsed %d extents from a declared count of %d", len(extents), numberOfExtents)
+		}
+
+		// findExtentForBlock binary searches, so it is only correct on a list
+		// that is sorted and free of overlaps. Those are invariants of the
+		// assembly path, and they have to hold for arbitrary on-disk bytes,
+		// not just for the ones a healthy filesystem produces.
+		extents = normalizeExtents(extents)
+		filled := fillSparseExtents(extents, numberOfBlocks)
+
+		previousEnd := uint64(0)
+		for i, extent := range filled {
+			if extent.LogicalBlockNumber < previousEnd {
+				t.Fatalf("extent[%d] starts at logical block %d, inside the previous extent ending at %d",
+					i, extent.LogicalBlockNumber, previousEnd)
 			}
-			if len(extents) > 0 && numberOfExtents == 0 && !addSparse {
-				t.Fatalf("extents produced from a zero count: %d", len(extents))
+			previousEnd = extent.LogicalBlockNumber + uint64(extent.NumberOfBlocks)
+		}
+
+		// Every block the search is asked about must resolve consistently with
+		// a plain scan of the same list.
+		for _, probe := range []uint64{0, 1, numberOfBlocks, numberOfBlocks + 1} {
+			found, _ := findExtentForBlock(filled, probe)
+			var scanned *Extent
+			for i := range filled {
+				start := filled[i].LogicalBlockNumber
+				if probe >= start && probe < start+uint64(filled[i].NumberOfBlocks) {
+					scanned = &filled[i]
+					break
+				}
+			}
+			if (found == nil) != (scanned == nil) {
+				t.Fatalf("block %d: binary search and linear scan disagree (%v vs %v)", probe, found, scanned)
+			}
+			if found != nil && scanned != nil && *found != *scanned {
+				t.Fatalf("block %d: binary search found %+v, linear scan found %+v", probe, *found, *scanned)
 			}
 		}
 	})

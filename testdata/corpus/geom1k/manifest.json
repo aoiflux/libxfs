@@ -1,0 +1,32 @@
+{
+  "case": "geom1k",
+  "generator": "mkfs.xfs version 6.6.0",
+  "oracle_used": "kernel mount and xfs_db",
+  "block_size": 1024,
+  "directory_block_size": 4096,
+  "root_inode": 64,
+  "total_paths": 3404,
+  "total_directories": 3,
+  "path_set_sha256": "b3c6e6b2e51609c806a05f505f722bf1cbb9dc20db78accb3af87488a4645511",
+  "attribute_set_sha256": "0658cc5245f88757be9df82c591409dc2a41516824fe8b8b823a05645d7674ab",
+  "directories": [
+    {
+      "path": "/",
+      "inode": 64,
+      "source_format": "short_form",
+      "entries": 3
+    },
+    {
+      "path": "/leafdir",
+      "inode": 67,
+      "source_format": "leaf",
+      "entries": 400
+    },
+    {
+      "path": "/nodedir",
+      "inode": 262208,
+      "source_format": "node",
+      "entries": 3000
+    }
+  ]
+}

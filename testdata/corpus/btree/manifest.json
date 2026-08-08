@@ -1,0 +1,74 @@
+{
+  "case": "btree",
+  "generator": "mkfs.xfs version 6.6.0",
+  "oracle_used": "kernel mount and xfs_db",
+  "block_size": 4096,
+  "directory_block_size": 4096,
+  "root_inode": 128,
+  "total_paths": 48010,
+  "total_directories": 10,
+  "path_set_sha256": "eac4c4c4cbd6ba737d24967cd256f4366927d95f637d8a3fcd8088dfd08c3fb2",
+  "attribute_set_sha256": "870c628be1b41c3cd133c20466b0efc6f4916680a075bf91f3dd6849dbdb3077",
+  "directories": [
+    {
+      "path": "/",
+      "inode": 128,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/frag",
+      "inode": 131,
+      "source_format": "short_form",
+      "entries": 8
+    },
+    {
+      "path": "/frag/d0",
+      "inode": 262272,
+      "source_format": "node",
+      "entries": 6000
+    },
+    {
+      "path": "/frag/d1",
+      "inode": 655488,
+      "source_format": "node",
+      "entries": 6000
+    },
+    {
+      "path": "/frag/d2",
+      "inode": 786560,
+      "source_format": "node",
+      "entries": 6000
+    },
+    {
+      "path": "/frag/d3",
+      "inode": 132,
+      "source_format": "node",
+      "entries": 6000
+    },
+    {
+      "path": "/frag/d4",
+      "inode": 262273,
+      "source_format": "node",
+      "entries": 6000
+    },
+    {
+      "path": "/frag/d5",
+      "inode": 655489,
+      "source_format": "node",
+      "entries": 6000
+    },
+    {
+      "path": "/frag/d6",
+      "inode": 786561,
+      "source_format": "node",
+      "entries": 6000
+    },
+    {
+      "path": "/frag/d7",
+      "inode": 133,
+      "source_format": "node",
+      "entries": 6000
+    }
+  ]
+}

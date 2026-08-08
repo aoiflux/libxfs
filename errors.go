@@ -18,6 +18,10 @@ var (
 	ErrUnsupportedXattrFormat = errors.New("unsupported extended attribute format")
 	ErrVolumeClosed           = errors.New("volume is closed")
 	ErrVerificationFailed     = errors.New("forensic verification failed")
+	// ErrDirectoryTruncated reports that a directory scan stopped at a
+	// configured cap and the listing is therefore not the whole directory.
+	// It is returned alongside everything that was recovered.
+	ErrDirectoryTruncated = errors.New("directory scan truncated at a configured limit")
 )
 
 type ParseError struct {

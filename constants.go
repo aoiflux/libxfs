@@ -79,6 +79,19 @@ const xfsBigTimeEpochOffsetSeconds = int64(2147483648)
 
 const maxBtreeRecursionDepth = 256
 
+// Extent range flags reported in Extent.RangeFlags.
 const (
+	// ExtentFlagSparse marks a range that reads back as zeros. It covers both
+	// unmapped holes and preallocated-but-unwritten extents, because from a
+	// reader's point of view they are the same thing.
 	ExtentFlagSparse uint32 = 0x00000001
+	// ExtentFlagUnwritten marks a range that is allocated on disk but has
+	// never been written, as produced by fallocate. It is always accompanied
+	// by ExtentFlagSparse, since it too reads as zeros, but unlike a hole it
+	// has a real PhysicalBlockNumber and occupies space.
+	//
+	// The distinction matters forensically: a hole says nothing was ever
+	// stored there, while an unwritten extent names blocks that were reserved,
+	// and whose previous contents may still be on the medium.
+	ExtentFlagUnwritten uint32 = 0x00000002
 )

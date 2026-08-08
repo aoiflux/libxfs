@@ -1,0 +1,278 @@
+{
+  "case": "mixed",
+  "generator": "mkfs.xfs version 6.6.0",
+  "oracle_used": "kernel mount and xfs_db",
+  "block_size": 4096,
+  "directory_block_size": 4096,
+  "root_inode": 128,
+  "total_paths": 3918,
+  "total_directories": 44,
+  "path_set_sha256": "e6e87c965418cf3039f7345f58e3bf44ea44c7842d9ceaebdb105ab4ec6f80db",
+  "attribute_set_sha256": "3ad5b3412fbe364b07c1b1e97e3d0317c83e4f60686d0d5bdb98677a9eae7af3",
+  "directories": [
+    {
+      "path": "/",
+      "inode": 128,
+      "source_format": "short_form",
+      "entries": 2
+    },
+    {
+      "path": "/a",
+      "inode": 131,
+      "source_format": "short_form",
+      "entries": 2
+    },
+    {
+      "path": "/a/b",
+      "inode": 262272,
+      "source_format": "short_form",
+      "entries": 2
+    },
+    {
+      "path": "/a/b/blockdir",
+      "inode": 134,
+      "source_format": "block",
+      "entries": 40
+    },
+    {
+      "path": "/a/b/c",
+      "inode": 655488,
+      "source_format": "short_form",
+      "entries": 2
+    },
+    {
+      "path": "/a/b/c/d",
+      "inode": 786560,
+      "source_format": "short_form",
+      "entries": 3
+    },
+    {
+      "path": "/a/b/c/d/e",
+      "inode": 132,
+      "source_format": "short_form",
+      "entries": 2
+    },
+    {
+      "path": "/a/b/c/d/e/f",
+      "inode": 262273,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/a/b/c/d/e/f/g",
+      "inode": 655489,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/a/b/c/d/e/f/g/h",
+      "inode": 786561,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/a/b/c/d/e/f/g/h/deepleaf",
+      "inode": 786562,
+      "source_format": "leaf",
+      "entries": 400
+    },
+    {
+      "path": "/a/b/c/d/nodedir",
+      "inode": 655490,
+      "source_format": "node",
+      "entries": 3000
+    },
+    {
+      "path": "/a/b/c/leafdir",
+      "inode": 262274,
+      "source_format": "leaf",
+      "entries": 400
+    },
+    {
+      "path": "/wide",
+      "inode": 175,
+      "source_format": "block",
+      "entries": 31
+    },
+    {
+      "path": "/wide/w01",
+      "inode": 262675,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w02",
+      "inode": 658747,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w03",
+      "inode": 786963,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w04",
+      "inode": 176,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w05",
+      "inode": 262677,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w06",
+      "inode": 658749,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w07",
+      "inode": 786965,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w08",
+      "inode": 178,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w09",
+      "inode": 262679,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w10",
+      "inode": 658751,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w11",
+      "inode": 786967,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w12",
+      "inode": 180,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w13",
+      "inode": 262681,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w14",
+      "inode": 658753,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w15",
+      "inode": 786969,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w16",
+      "inode": 182,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w17",
+      "inode": 262683,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w18",
+      "inode": 658755,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w19",
+      "inode": 786971,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w20",
+      "inode": 184,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w21",
+      "inode": 262685,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w22",
+      "inode": 658757,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w23",
+      "inode": 786973,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w24",
+      "inode": 186,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w25",
+      "inode": 262687,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w26",
+      "inode": 658759,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w27",
+      "inode": 786975,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w28",
+      "inode": 188,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w29",
+      "inode": 262689,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/wide/w30",
+      "inode": 658761,
+      "source_format": "short_form",
+      "entries": 1
+    }
+  ]
+}

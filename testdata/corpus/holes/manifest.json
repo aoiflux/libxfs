@@ -1,0 +1,26 @@
+{
+  "case": "holes",
+  "generator": "mkfs.xfs version 6.6.0",
+  "oracle_used": "kernel mount and xfs_db",
+  "block_size": 4096,
+  "directory_block_size": 4096,
+  "root_inode": 128,
+  "total_paths": 351,
+  "total_directories": 2,
+  "path_set_sha256": "afe76034c16e661cad379373b289b4659acdba2eb2aa2ee30cf3717523d7aa2f",
+  "attribute_set_sha256": "50e65aa68177ef47599f30472aa74985b1404e218238cfb1ba6cad95bc237a5a",
+  "directories": [
+    {
+      "path": "/",
+      "inode": 128,
+      "source_format": "short_form",
+      "entries": 1
+    },
+    {
+      "path": "/holed",
+      "inode": 131,
+      "source_format": "node",
+      "entries": 349
+    }
+  ]
+}
