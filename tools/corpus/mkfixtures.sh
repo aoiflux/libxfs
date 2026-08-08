@@ -34,6 +34,10 @@ die() { printf 'mkfixtures: %s\n' "$*" >&2; exit 1; }
 
 command -v xfs_metadump >/dev/null 2>&1 || die "xfs_metadump not found (apt install xfsprogs)"
 command -v xfs_mdrestore >/dev/null 2>&1 || die "xfs_mdrestore not found"
+# sudo replaces PATH with secure_path, which does not include a toolchain
+# installed under /usr/local/go, /snap or a CI tool cache.
+command -v go >/dev/null 2>&1 || die \
+	"go toolchain not found on PATH ($PATH); if running under sudo, invoke as: sudo -E env \"PATH=\$PATH\" $0"
 [ -d "$CORPUS_ROOT" ] || die "no corpus at $CORPUS_ROOT"
 
 rm -rf "$WORK"
@@ -80,6 +84,11 @@ for name in "${names[@]}"; do
 	gzip -9 -c "$WORK/$name.img" > "$target/image.img.gz"
 	built=$((built + 1))
 	log "$name: $(du -h "$target/image.img.gz" | cut -f1) fixture"
+
+	# Each metadump is tens of megabytes and is of no further use once it has
+	# been restored and compressed. Keeping them all would cost about a
+	# gigabyte of scratch for no reason.
+	rm -f "$WORK/$name.metadump" "$WORK/$name.img"
 done
 
 [ "$built" -gt 0 ] || die "no fixtures built"
@@ -88,8 +97,18 @@ done
 # oracle. Deriving them here would mean a second, divergent implementation.
 log "writing manifests from the oracle"
 cd "$REPO"
-env LIBXFS_CORPUS="$CORPUS_ROOT" LIBXFS_WRITE_FIXTURES=1 GOFLAGS=-buildvcs=false \
-	go test -count=1 -run TestWriteCorpusFixtureManifests -v . \
-	| sed -n 's/^ *//; /wrote /p' >&2
+# Not piped directly into a filter: a pipeline reports the exit status of its
+# last command, so a toolchain or test failure would be swallowed and the run
+# would report success having written no manifests at all.
+if ! env LIBXFS_CORPUS="$CORPUS_ROOT" LIBXFS_WRITE_FIXTURES=1 GOFLAGS=-buildvcs=false \
+	go test -count=1 -run TestWriteCorpusFixtureManifests -v . > "$WORK/manifests.log" 2>&1
+then
+	cat "$WORK/manifests.log" >&2
+	die "writing the fixture manifests failed"
+fi
+sed -n 's/^ *//; /wrote /p' "$WORK/manifests.log" >&2
+
+written=$(grep -c 'wrote ' "$WORK/manifests.log" || true)
+[ "$written" -eq "$built" ] || die "built $built fixtures but wrote $written manifests"
 
 printf 'built %d fixtures under %s\n' "$built" "$FIXTURE_ROOT" >&2

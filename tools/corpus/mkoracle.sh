@@ -36,7 +36,11 @@ require_root() {
 }
 
 build_oracle() {
-	command -v go >/dev/null 2>&1 || die "go toolchain not found"
+	# sudo replaces PATH with secure_path, which does not include a toolchain
+	# installed under /usr/local/go, /snap or a CI tool cache. Naming the cause
+	# saves the next person the same diagnosis.
+	command -v go >/dev/null 2>&1 || die \
+		"go toolchain not found on PATH ($PATH); if running under sudo, invoke as: sudo -E env \"PATH=\$PATH\" $0"
 	# GOCACHE is pinned so that running under sudo does not write into the
 	# invoking user's cache with root ownership. buildvcs is off because the
 	# build runs as root against a repository owned by someone else, and

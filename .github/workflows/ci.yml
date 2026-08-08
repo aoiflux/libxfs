@@ -87,17 +87,28 @@ jobs:
           check-latest: true
       - name: Install xfsprogs
         run: sudo apt-get update -qq && sudo apt-get install -y -qq xfsprogs attr
-      - name: Report kernel XFS support
-        # v4 images cannot be mounted on a kernel built without
-        # CONFIG_XFS_SUPPORT_V4. The tests fall back to the xfs_db oracle
-        # there, so this is recorded rather than required.
+      - name: Enable kernel XFS support
+        # XFS is a module on Ubuntu, and /proc/filesystems lists only what is
+        # built in or already loaded, so it has to be loaded before it can be
+        # looked for. Building the corpus needs a real mount: mkfs.xfs cannot
+        # populate a filesystem on its own.
         run: |
-          grep -q xfs /proc/filesystems || { echo "kernel has no XFS support"; exit 1; }
-          zcat /proc/config.gz 2>/dev/null | grep -i XFS_SUPPORT_V4 || echo "V4 support unknown"
+          sudo modprobe xfs || true
+          if ! grep -qw xfs /proc/filesystems; then
+            echo "This runner cannot mount XFS, so the corpus cannot be built."
+            exit 1
+          fi
+          # Whether v4 images can be mounted decides which oracle describes
+          # them. Recorded rather than required: the tests fall back to xfs_db.
+          grep -i XFS_SUPPORT_V4 "/boot/config-$(uname -r)" 2>/dev/null \
+            || echo "V4 mount support unknown on this kernel"
       - name: Build the corpus
         run: sudo tools/corpus/mkcorpus.sh
+      # PATH is passed through explicitly because these two scripts run the Go
+      # toolchain as root, and sudo replaces PATH with secure_path, which does
+      # not contain the toolchain setup-go installed.
       - name: Describe it with both oracles
-        run: sudo tools/corpus/mkoracle.sh
+        run: sudo -E env "PATH=$PATH" tools/corpus/mkoracle.sh
       - name: Diff the walk against ground truth
         run: tools/corpus/runtests.sh
       # The fixture manifests are committed but the images they describe are
@@ -106,7 +117,7 @@ jobs:
       # corpus from scratch is what stops those expectations from drifting away
       # from what mkfs.xfs actually produces.
       - name: Rebuild the fixture images
-        run: sudo tools/corpus/mkfixtures.sh
+        run: sudo -E env "PATH=$PATH" tools/corpus/mkfixtures.sh
       - name: Check the committed manifests still hold
         run: go test -count=1 -run TestCommittedCorpusFixtures -v .
       # mkfixtures.sh rewrites the manifests from the oracle. If that changed
